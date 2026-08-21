@@ -1,0 +1,31 @@
+# Cache and database
+.lumina_cache/
+backend/photos.db
+backend/photos.db-wal
+backend/photos.db-shm
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+.venv/
+env/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.oxlintrc.json
+
+# Operating System
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+
+# VS Code / IDE
+.vscode/
+.idea/

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <defs>
+    <linearGradient id="luminaGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="50%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="8" fill="#0f172a"/>
+  <circle cx="16" cy="17" r="8" fill="none" stroke="url(#luminaGrad)" stroke-width="2.5"/>
+  <circle cx="16" cy="17" r="4" fill="url(#luminaGrad)"/>
+  <circle cx="23" cy="9" r="1.5" fill="#10b981"/>
+  <path d="M11 9h3l1.5-2h5l1.5 2h3a2 2 0 0 1 2 2v1a1 1 0 0 1-1 1h-16a1 1 0 0 1-1-1v-1a2 2 0 0 1 2-2z" fill="url(#luminaGrad)" opacity="0.6"/>
+</svg>
