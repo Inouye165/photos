@@ -157,6 +157,7 @@ def get_photos(
     include_duplicates: bool = True,
     camera_make: Optional[str] = None,
     has_gps: Optional[bool] = None,
+    year: Optional[str] = None,
     sort_by: str = "date_taken",
     sort_order: str = "DESC",
     limit: int = 100,
@@ -170,7 +171,7 @@ def get_photos(
     params = []
 
     if photo_ids is not None:
-        clean_ids = [int(x) for x in photo_ids]
+        clean_ids = list(photo_ids)
         if not clean_ids:
             conn.close()
             return [], 0
@@ -196,6 +197,10 @@ def get_photos(
             conditions.append("latitude IS NOT NULL AND longitude IS NOT NULL")
         elif has_gps is False:
             conditions.append("(latitude IS NULL OR longitude IS NULL)")
+
+        if year:
+            conditions.append("SUBSTR(COALESCE(date_taken, datetime(file_modified_at, 'unixepoch')), 1, 4) = ?")
+            params.append(year)
 
     where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
     

@@ -1,14 +1,116 @@
-import React from 'react';
-import { Camera, Calendar, Copy, Sparkles, Image as ImageIcon, MapPin } from 'lucide-react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
+import { Camera, Calendar, Copy, Sparkles, Image as ImageIcon, MapPin, ArrowUp, Loader2 } from 'lucide-react';
 
-export default function PhotoGrid({ photos, onSelectPhoto, query, isLoading }) {
-  if (isLoading) {
+export default function PhotoGrid({
+  photos = [],
+  totalPhotos = 0,
+  onSelectPhoto,
+  query,
+  isLoading = false,
+  isLoadingMore = false,
+  hasMore = false,
+  onLoadMore,
+  groupByDate = true
+}) {
+  const sentinelRef = useRef(null);
+  const [showScrollTop, setShowScrollTop] = useState(false);
+
+  // Monitor scroll for Back-to-Top button
+  useEffect(() => {
+    const handleScroll = () => {
+      setShowScrollTop(window.scrollY > 600);
+    };
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  // IntersectionObserver for continuous Infinite Scrolling
+  useEffect(() => {
+    if (!hasMore || isLoadingMore || isLoading || !onLoadMore) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const first = entries[0];
+        if (first.isIntersecting) {
+          onLoadMore();
+        }
+      },
+      { rootMargin: '400px' }
+    );
+
+    const currentSentinel = sentinelRef.current;
+    if (currentSentinel) {
+      observer.observe(currentSentinel);
+    }
+
+    return () => {
+      if (currentSentinel) {
+        observer.unobserve(currentSentinel);
+      }
+    };
+  }, [hasMore, isLoadingMore, isLoading, onLoadMore]);
+
+  const scrollToTop = () => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const formatDate = (isoString) => {
+    if (!isoString) return '';
+    try {
+      const d = new Date(isoString);
+      return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    } catch {
+      return '';
+    }
+  };
+
+  const formatMonthYear = (isoString) => {
+    if (!isoString) return 'Undated Photos';
+    try {
+      const d = new Date(isoString);
+      return d.toLocaleDateString(undefined, { year: 'numeric', month: 'long' });
+    } catch {
+      return 'Undated Photos';
+    }
+  };
+
+  // Group photos into Month-Year sections if query is not active
+  const groupedSections = useMemo(() => {
+    if (query || !groupByDate || photos.length === 0) {
+      return [{ title: null, items: photos }];
+    }
+
+    const sections = [];
+    let currentTitle = null;
+    let currentItems = [];
+
+    for (const photo of photos) {
+      const title = formatMonthYear(photo.date_taken);
+      if (title !== currentTitle) {
+        if (currentItems.length > 0) {
+          sections.push({ title: currentTitle, items: currentItems });
+        }
+        currentTitle = title;
+        currentItems = [photo];
+      } else {
+        currentItems.push(photo);
+      }
+    }
+
+    if (currentItems.length > 0) {
+      sections.push({ title: currentTitle, items: currentItems });
+    }
+
+    return sections;
+  }, [photos, query, groupByDate]);
+
+  if (isLoading && photos.length === 0) {
     return (
       <div style={{ textAlign: 'center', padding: '5rem 0', color: '#94a3b8' }}>
         <div style={{ display: 'inline-block', animation: 'spin 1s linear infinite' }}>
           <Sparkles size={32} color="#10b981" />
         </div>
-        <p style={{ marginTop: '1rem', fontSize: '0.95rem' }}>Searching vector database...</p>
+        <p style={{ marginTop: '1rem', fontSize: '0.95rem' }}>Loading photo library...</p>
       </div>
     );
   }
@@ -26,90 +128,128 @@ export default function PhotoGrid({ photos, onSelectPhoto, query, isLoading }) {
       }}>
         <ImageIcon size={48} color="#475569" style={{ marginBottom: '1rem' }} />
         <h3 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.25rem', marginBottom: '0.5rem', color: '#f1f5f9' }}>
-          {query ? `No matching photos for "${query}"` : 'No photos indexed yet'}
+          {query ? `No matching photos for "${query}"` : 'No photos found in this filter'}
         </h3>
         <p style={{ color: '#94a3b8', fontSize: '0.875rem' }}>
           {query
-            ? 'Try another search prompt or scan a folder with more pictures.'
-            : 'Click "Scan Folder" in the top right to index your photos and build the vector database.'}
+            ? 'Try another search prompt or adjust your filters.'
+            : 'Try selecting "All Years" or clearing filters to view all photos.'}
         </p>
       </div>
     );
   }
 
-  const formatFileSize = (bytes) => {
-    if (!bytes) return '';
-    const mb = bytes / (1024 * 1024);
-    return mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
-  };
-
-  const formatDate = (isoString) => {
-    if (!isoString) return '';
-    try {
-      const d = new Date(isoString);
-      return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-    } catch {
-      return '';
-    }
-  };
-
   return (
-    <div className="photo-grid">
-      {photos.map((photo) => {
-        const thumbUrl = `/api/photos/${photo.id}/thumbnail`;
-        const hasDups = photo.duplicate_count > 0;
-        const simScore = photo.similarity_score !== undefined
-          ? Math.round(photo.similarity_score * 100)
-          : null;
+    <div className="photo-grid-container">
+      {/* Progress pill */}
+      <div className="photo-progress-bar">
+        <span>
+          Showing <strong>{photos.length.toLocaleString()}</strong> of{' '}
+          <strong>{totalPhotos.toLocaleString()}</strong> photos
+        </span>
+      </div>
 
-        return (
-          <div
-            key={photo.id}
-            className="photo-card"
-            onClick={() => onSelectPhoto(photo)}
-          >
-            <div className="photo-card-img-wrap">
-              <img
-                src={thumbUrl}
-                alt={photo.file_name}
-                className="photo-card-img"
-                loading="lazy"
-                onError={(e) => {
-                  e.target.style.display = 'none';
-                }}
-              />
-              
-              {/* Badges */}
-              <div className="photo-badge-top-left">
-                {simScore !== null && (
-                  <span className="badge-sim">
-                    <Sparkles size={10} />
-                    <span>{simScore}% Match</span>
-                  </span>
-                )}
-                {hasDups && (
-                  <span className="badge-dup">
-                    <Copy size={10} />
-                    <span>{photo.duplicate_count + 1} Duplicates</span>
-                  </span>
-                )}
-              </div>
+      {groupedSections.map((section, sIdx) => (
+        <div key={sIdx} className="photo-grid-section">
+          {section.title && (
+            <div className="section-date-header">
+              <Calendar size={15} color="#10b981" />
+              <span>{section.title}</span>
+              <span className="section-count">{section.items.length} {section.items.length === 1 ? 'photo' : 'photos'}</span>
             </div>
+          )}
 
-            <div className="photo-card-info">
-              <div className="photo-card-name" title={photo.file_name}>
-                {photo.file_name}
-              </div>
-              <div className="photo-card-meta">
-                <span className="photo-card-camera">
-                  {photo.camera_model || photo.camera_make || (photo.width ? `${photo.width}×${photo.height}` : 'Photo')}
-                </span>
-                <span>{formatDate(photo.date_taken)}</span>
-              </div>
-            </div>
+          <div className="photo-grid">
+            {section.items.map((photo) => {
+              const thumbUrl = `/api/photos/${photo.id}/thumbnail`;
+              const hasDups = photo.duplicate_count > 0;
+              const hasGps = photo.latitude !== null && photo.longitude !== null;
+              const simScore = photo.similarity_score !== undefined
+                ? Math.round(photo.similarity_score * 100)
+                : null;
+
+              return (
+                <div
+                  key={photo.id}
+                  className="photo-card"
+                  onClick={() => onSelectPhoto(photo)}
+                >
+                  <div className="photo-card-img-wrap">
+                    <img
+                      src={thumbUrl}
+                      alt={photo.file_name}
+                      className="photo-card-img"
+                      loading="lazy"
+                      onError={(e) => {
+                        e.target.style.display = 'none';
+                      }}
+                    />
+                    
+                    {/* Badges */}
+                    <div className="photo-badge-top-left">
+                      {simScore !== null && (
+                        <span className="badge-sim">
+                          <Sparkles size={10} />
+                          <span>{simScore}% Match</span>
+                        </span>
+                      )}
+                      {hasDups && (
+                        <span className="badge-dup">
+                          <Copy size={10} />
+                          <span>{photo.duplicate_count + 1} Duplicates</span>
+                        </span>
+                      )}
+                      {hasGps && (
+                        <span className="badge-gps" title="Geotagged with GPS coordinates">
+                          <MapPin size={10} />
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="photo-card-info">
+                    <div className="photo-card-name" title={photo.file_name}>
+                      {photo.file_name}
+                    </div>
+                    <div className="photo-card-meta">
+                      <span className="photo-card-camera">
+                        {photo.camera_model || photo.camera_make || (photo.width ? `${photo.width}×${photo.height}` : 'Photo')}
+                      </span>
+                      <span>{formatDate(photo.date_taken)}</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
           </div>
-        );
-      })}
+        </div>
+      ))}
+
+      {/* Infinite Scroll Sentinel */}
+      <div ref={sentinelRef} className="infinite-scroll-sentinel">
+        {isLoadingMore && (
+          <div className="infinite-loader">
+            <Loader2 size={24} className="spin-icon" color="#10b981" />
+            <span>Loading more photos...</span>
+          </div>
+        )}
+        {!hasMore && photos.length > 0 && (
+          <div className="end-of-library">
+            <span>You've reached the end of the collection ({photos.length.toLocaleString()} photos)</span>
+          </div>
+        )}
+      </div>
+
+      {/* Floating Scroll To Top Button */}
+      {showScrollTop && (
+        <button
+          className="scroll-top-btn"
+          onClick={scrollToTop}
+          title="Back to Top"
+        >
+          <ArrowUp size={20} />
+        </button>
+      )}
     </div>
   );
 }

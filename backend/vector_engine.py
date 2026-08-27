@@ -8,7 +8,7 @@ import os
 import threading
 import numpy as np
 from PIL import Image
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, cast
 from sentence_transformers import SentenceTransformer
 from backend.database import get_connection, DB_PATH
 
@@ -113,7 +113,7 @@ class VectorEngine:
         try:
             with Image.open(file_path) as img:
                 rgb_img = img.convert("RGB") if img.mode != "RGB" else img
-                emb = self.model.encode(rgb_img, show_progress_bar=False, normalize_embeddings=True)
+                emb = cast(Any, self.model).encode([rgb_img], show_progress_bar=False, normalize_embeddings=True)[0]
                 return np.array(emb, dtype=np.float32)
         except Exception:
             return None
@@ -125,11 +125,12 @@ class VectorEngine:
             return False
 
         with self._lock:
-            if photo_id in self.photo_ids:
+            if photo_id in self.photo_ids and self.embeddings is not None:
                 idx = self.photo_ids.index(photo_id)
                 self.embeddings[idx] = emb
             else:
-                self.photo_ids.append(photo_id)
+                if photo_id not in self.photo_ids:
+                    self.photo_ids.append(photo_id)
                 if self.embeddings is None or len(self.embeddings) == 0:
                     self.embeddings = np.expand_dims(emb, axis=0)
                 else:
@@ -166,7 +167,7 @@ class VectorEngine:
 
             if valid_images:
                 try:
-                    batch_embs = self.model.encode(
+                    batch_embs = cast(Any, self.model).encode(
                         valid_images,
                         batch_size=len(valid_images),
                         show_progress_bar=False,
@@ -177,11 +178,12 @@ class VectorEngine:
                     with self._lock:
                         for idx, pid in enumerate(valid_ids):
                             emb = batch_embs[idx]
-                            if pid in self.photo_ids:
+                            if pid in self.photo_ids and self.embeddings is not None:
                                 p_idx = self.photo_ids.index(pid)
                                 self.embeddings[p_idx] = emb
                             else:
-                                self.photo_ids.append(pid)
+                                if pid not in self.photo_ids:
+                                    self.photo_ids.append(pid)
                                 if self.embeddings is None or len(self.embeddings) == 0:
                                     self.embeddings = np.expand_dims(emb, axis=0)
                                 else:

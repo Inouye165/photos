@@ -10,6 +10,7 @@ export async function fetchPhotos({
   includeDuplicates = true,
   cameraMake = null,
   hasGps = null,
+  year = null,
   sortBy = 'date_taken',
   sortOrder = 'DESC',
   limit = 60,
@@ -21,6 +22,7 @@ export async function fetchPhotos({
   params.append('include_duplicates', includeDuplicates ? 'true' : 'false');
   if (cameraMake) params.append('camera_make', cameraMake);
   if (hasGps !== null) params.append('has_gps', hasGps ? 'true' : 'false');
+  if (year) params.append('year', year);
   params.append('sort_by', sortBy);
   params.append('sort_order', sortOrder);
   params.append('limit', limit);

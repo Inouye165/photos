@@ -74,7 +74,7 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
     }
   };
 
-  const hasGps = details.latitude !== null && details.longitude !== null;
+  const hasGps = details.latitude != null && details.longitude != null && !isNaN(Number(details.latitude)) && !isNaN(Number(details.longitude));
   const mapsUrl = hasGps
     ? `https://www.google.com/maps?q=${details.latitude},${details.longitude}`
     : null;
@@ -237,11 +237,14 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
             <span className="exif-label">Date Taken</span>
             <span className="exif-value">{details.date_taken || 'N/A'}</span>
           </div>
-          {hasGps && (
+          {hasGps ? (
             <>
               <div className="exif-row">
                 <span className="exif-label">GPS Coordinates</span>
-                <span className="exif-value">{details.latitude?.toFixed(4)}, {details.longitude?.toFixed(4)}</span>
+                <span className="exif-value">
+                  {Number(details.latitude).toFixed(4)}, {Number(details.longitude).toFixed(4)}
+                  {details.altitude != null && !isNaN(Number(details.altitude)) ? ` (${Math.round(Number(details.altitude))}m alt)` : ''}
+                </span>
               </div>
               <div style={{ marginTop: '0.5rem', textAlign: 'right' }}>
                 <a
@@ -256,6 +259,11 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
                 </a>
               </div>
             </>
+          ) : (
+            <div className="exif-row">
+              <span className="exif-label">GPS Geotag</span>
+              <span className="exif-value" style={{ color: '#64748b' }}>None</span>
+            </div>
           )}
         </div>
 

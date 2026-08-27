@@ -28,6 +28,8 @@ from backend.thumbnails import get_thumbnail_path, generate_thumbnail
 from backend.vector_engine import VectorEngine
 from backend.deduplicator import run_deduplication_pass
 
+from contextlib import asynccontextmanager
+
 # Ensure DB is initialized
 init_db()
 
@@ -43,15 +45,17 @@ def ensure_all_embeddings_in_background():
     except Exception as e:
         print(f"Background embedding error: {e}")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    threading.Thread(target=ensure_all_embeddings_in_background, daemon=True).start()
+    yield
+
 app = FastAPI(
     title="LuminaPhoto API",
     description="Semantic Photo Discovery, Deduplication & EXIF Management System",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
-
-@app.on_event("startup")
-def on_startup():
-    threading.Thread(target=ensure_all_embeddings_in_background, daemon=True).start()
 
 # Enable CORS for local development
 app.add_middleware(
@@ -174,6 +178,7 @@ def list_photos(
     include_duplicates: bool = Query(True, description="Whether to include duplicate copies"),
     camera_make: Optional[str] = Query(None, description="Filter by camera make"),
     has_gps: Optional[bool] = Query(None, description="Filter by presence of GPS geotag"),
+    year: Optional[str] = Query(None, description="Filter by year (e.g. 2026, 2025)"),
     sort_by: str = Query("date_taken", description="Sort field: date_taken, file_name, file_size, indexed_at"),
     sort_order: str = Query("DESC", description="Sort direction: ASC, DESC"),
     limit: int = Query(60, ge=1, le=200),
@@ -219,6 +224,7 @@ def list_photos(
         include_duplicates=include_duplicates,
         camera_make=camera_make,
         has_gps=has_gps,
+        year=year,
         sort_by=sort_by,
         sort_order=sort_order,
         limit=limit,
@@ -298,7 +304,7 @@ def get_photo_original(photo_id: int):
 import socket
 
 try:
-    import send2trash
+    import send2trash  # type: ignore
 except Exception:
     send2trash = None
 

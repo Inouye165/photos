@@ -29,7 +29,7 @@ def select_best_primary(photos: List[Dict[str, Any]]) -> Dict[str, Any]:
     3. Larger file size (less compression / higher bit depth)
     4. Earliest date taken
     """
-    def score_photo(p: Dict[str, Any]) -> Tuple[int, int, int, str]:
+    def score_photo(p: Dict[str, Any]) -> Tuple[int, int, int, int]:
         exif_score = 2 if p.get("classification") == "VERIFIED_PHOTO" else 1
         res_score = (p.get("width") or 0) * (p.get("height") or 0)
         size_score = p.get("file_size") or 0

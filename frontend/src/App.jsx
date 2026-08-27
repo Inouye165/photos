@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Header from './components/Header';
 import SemanticSearch from './components/SemanticSearch';
 import PhotoGrid from './components/PhotoGrid';
@@ -7,8 +7,11 @@ import DuplicatesView from './components/DuplicatesView';
 import FilteredView from './components/FilteredView';
 import ScanModal from './components/ScanModal';
 import MobileConnectModal from './components/MobileConnectModal';
+import TimelineScrubber from './components/TimelineScrubber';
 import { fetchPhotos, fetchStats } from './api';
-import { Filter, SlidersHorizontal, MapPin, Eye, EyeOff, Sparkles, Copy, ShieldAlert, Smartphone } from 'lucide-react';
+import { Filter, SlidersHorizontal, MapPin, Eye, EyeOff, Sparkles, Copy, ShieldAlert, Smartphone, Calendar } from 'lucide-react';
+
+const PAGE_SIZE = 80;
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('photos'); // 'photos', 'duplicates', 'filtered'
@@ -18,12 +21,15 @@ export default function App() {
   
   // Search & Filter state
   const [query, setQuery] = useState('');
+  const [selectedYear, setSelectedYear] = useState(null);
   const [cameraMake, setCameraMake] = useState('');
   const [hasGps, setHasGps] = useState(null);
   const [includeDuplicates, setIncludeDuplicates] = useState(true);
   const [sortBy, setSortBy] = useState('date_taken');
   const [sortOrder, setSortOrder] = useState('DESC');
   const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
 
   // Selected photo for Lightbox
   const [selectedPhoto, setSelectedPhoto] = useState(null);
@@ -38,42 +44,88 @@ export default function App() {
       .catch(console.error);
   }, []);
 
-  const loadPhotos = useCallback((searchQuery = query) => {
-    setIsLoading(true);
-    fetchPhotos({
-      query: searchQuery,
-      includeDuplicates,
-      cameraMake: cameraMake || null,
-      hasGps: hasGps,
-      sortBy,
-      sortOrder,
-      limit: 100,
-      offset: 0
-    })
-      .then((data) => {
-        setPhotos(data.photos || []);
-        setTotalPhotos(data.total || 0);
-        setIsLoading(false);
-      })
-      .catch((err) => {
-        console.error(err);
-        setIsLoading(false);
-      });
-  }, [query, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder]);
+  const loadPhotos = useCallback((options = {}) => {
+    const isLoadMore = options.isLoadMore || false;
+    const searchQuery = options.searchQuery !== undefined ? options.searchQuery : query;
+    const yearFilter = options.year !== undefined ? options.year : selectedYear;
 
+    if (isLoadMore) {
+      setIsLoadingMore(true);
+      fetchPhotos({
+        query: searchQuery,
+        year: yearFilter,
+        includeDuplicates,
+        cameraMake: cameraMake || null,
+        hasGps: hasGps,
+        sortBy,
+        sortOrder,
+        limit: PAGE_SIZE,
+        offset: photos.length
+      })
+        .then((data) => {
+          const newItems = data.photos || [];
+          setPhotos((prev) => [...prev, ...newItems]);
+          setTotalPhotos(data.total || 0);
+          setHasMore(photos.length + newItems.length < (data.total || 0));
+          setIsLoadingMore(false);
+        })
+        .catch((err) => {
+          console.error('Error loading more photos:', err);
+          setIsLoadingMore(false);
+        });
+    } else {
+      setIsLoading(true);
+      fetchPhotos({
+        query: searchQuery,
+        year: yearFilter,
+        includeDuplicates,
+        cameraMake: cameraMake || null,
+        hasGps: hasGps,
+        sortBy,
+        sortOrder,
+        limit: PAGE_SIZE,
+        offset: 0
+      })
+        .then((data) => {
+          const items = data.photos || [];
+          setPhotos(items);
+          setTotalPhotos(data.total || 0);
+          setHasMore(items.length < (data.total || 0));
+          setIsLoading(false);
+        })
+        .catch((err) => {
+          console.error('Error loading photos:', err);
+          setIsLoading(false);
+        });
+    }
+  }, [query, selectedYear, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder, photos.length]);
+
+  // Initial load or filter changes
   useEffect(() => {
     loadStats();
-    loadPhotos();
-  }, [loadStats, loadPhotos]);
+  }, [loadStats]);
+
+  useEffect(() => {
+    loadPhotos({ isLoadMore: false });
+  }, [query, selectedYear, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder]);
 
   const handleSearch = (searchQuery) => {
     setQuery(searchQuery);
-    loadPhotos(searchQuery);
+  };
+
+  const handleSelectYear = (year) => {
+    setSelectedYear(year);
+  };
+
+  const handleLoadMore = () => {
+    if (!isLoadingMore && hasMore && !isLoading) {
+      loadPhotos({ isLoadMore: true });
+    }
   };
 
   const handleRefreshLibrary = useCallback(() => {
     loadStats();
-    loadPhotos();
+    loadPhotos({ isLoadMore: false });
   }, [loadStats, loadPhotos]);
 
   return (
@@ -104,6 +156,14 @@ export default function App() {
               setQuery={setQuery}
               onSearch={handleSearch}
               isLoading={isLoading}
+            />
+
+            {/* Timeline Scrubber */}
+            <TimelineScrubber
+              timelineYears={stats?.timeline_years || []}
+              selectedYear={selectedYear}
+              onSelectYear={handleSelectYear}
+              totalPhotos={stats?.total_photos || totalPhotos}
             />
 
             {/* Filter and sorting controls */}
@@ -179,9 +239,13 @@ export default function App() {
             {/* Photo Grid */}
             <PhotoGrid
               photos={photos}
+              totalPhotos={totalPhotos}
               onSelectPhoto={(photo) => setSelectedPhoto(photo)}
               query={query}
               isLoading={isLoading}
+              isLoadingMore={isLoadingMore}
+              hasMore={hasMore}
+              onLoadMore={handleLoadMore}
             />
           </>
         )}

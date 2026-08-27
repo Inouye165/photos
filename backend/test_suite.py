@@ -135,7 +135,7 @@ def run_tests():
 
         # Step 5: Test Non-destructive Thumbnail Generation
         thumb_path = generate_thumbnail(samples["cam_photo"], p1_id, "thumb")
-        assert os.path.exists(thumb_path), "Thumbnail file was not created"
+        assert thumb_path is not None and os.path.exists(thumb_path), "Thumbnail file was not created"
         with Image.open(thumb_path) as t_img:
             assert t_img.width <= 320 and t_img.height <= 320, "Thumbnail dimension exceeds 320"
         print("[PASS] Thumbnail Generator: Generated fast WebP cached preview", flush=True)
