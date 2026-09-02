@@ -10,10 +10,13 @@ export async function fetchPhotos({
   includeDuplicates = true,
   cameraMake = null,
   hasGps = null,
+  year = null,
   sortBy = 'date_taken',
   sortOrder = 'DESC',
   limit = 60,
-  offset = 0
+  offset = 0,
+  knownTotal = null,
+  signal = null
 } = {}) {
   const params = new URLSearchParams();
   if (query) params.append('query', query);
@@ -21,12 +24,14 @@ export async function fetchPhotos({
   params.append('include_duplicates', includeDuplicates ? 'true' : 'false');
   if (cameraMake) params.append('camera_make', cameraMake);
   if (hasGps !== null) params.append('has_gps', hasGps ? 'true' : 'false');
+  if (year) params.append('year', year);
   params.append('sort_by', sortBy);
   params.append('sort_order', sortOrder);
   params.append('limit', limit);
   params.append('offset', offset);
+  if (knownTotal !== null) params.append('known_total', knownTotal);
 
-  const res = await fetch(`${API_BASE}/photos?${params.toString()}`);
+  const res = await fetch(`${API_BASE}/photos?${params.toString()}`, { signal });
   if (!res.ok) throw new Error('Failed to fetch photos');
   return res.json();
 }
@@ -59,6 +64,105 @@ export async function dismissDuplicateGroup(groupId) {
     method: 'POST'
   });
   if (!res.ok) throw new Error('Failed to dismiss duplicate group');
+  return res.json();
+}
+
+export async function trashAllDuplicates() {
+  const res = await fetch(`${API_BASE}/duplicates/trash-all`, {
+    method: 'POST'
+  });
+  if (!res.ok) throw new Error('Failed to move all duplicates to trash');
+  return res.json();
+}
+
+export async function trashGroupDuplicates(groupId) {
+  const res = await fetch(`${API_BASE}/duplicates/group/${groupId}/trash`, {
+    method: 'POST'
+  });
+  if (!res.ok) throw new Error('Failed to move duplicate copies to trash');
+  return res.json();
+}
+
+export async function tagPhotoTrash(photoId, isTrashed = true) {
+  const res = await fetch(`${API_BASE}/photos/${photoId}/trash`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ is_trashed: isTrashed })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update trash status');
+  }
+  return res.json();
+}
+
+export async function batchTagTrash(photoIds, isTrashed = true) {
+  const res = await fetch(`${API_BASE}/photos/batch-trash`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ photo_ids: photoIds, is_trashed: isTrashed })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to batch update trash status');
+  }
+  return res.json();
+}
+
+export async function fetchTrash({ limit = 60, offset = 0 } = {}) {
+  const res = await fetch(`${API_BASE}/trash?limit=${limit}&offset=${offset}`);
+  if (!res.ok) throw new Error('Failed to fetch trash');
+  return res.json();
+}
+
+export async function emptyTrash(permanent = true) {
+  const res = await fetch(`${API_BASE}/trash/empty?permanent=${permanent}`, {
+    method: 'POST'
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to empty trash');
+  }
+  return res.json();
+}
+
+export async function restoreAllTrash() {
+  const res = await fetch(`${API_BASE}/trash/restore-all`, {
+    method: 'POST'
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to restore trash');
+  }
+  return res.json();
+}
+
+export async function fetchTrashSpaceStatus(minFreeGb = 5.0) {
+  const res = await fetch(`${API_BASE}/trash/space-status?min_free_gb=${minFreeGb}`);
+  if (!res.ok) throw new Error('Failed to fetch trash space status');
+  return res.json();
+}
+
+export async function purgeTrashForSpace({ minFreeGb = 5.0, forcePurgeCount = null, targetBytesToFree = null } = {}) {
+  const res = await fetch(`${API_BASE}/trash/purge-for-space`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      min_free_gb: minFreeGb,
+      force_purge_count: forcePurgeCount,
+      target_bytes_to_free: targetBytesToFree
+    })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to purge space');
+  }
+  return res.json();
+}
+
+export async function fetchPurgeLogs(limit = 50) {
+  const res = await fetch(`${API_BASE}/trash/purge-logs?limit=${limit}`);
+  if (!res.ok) throw new Error('Failed to fetch purge logs');
   return res.json();
 }
 

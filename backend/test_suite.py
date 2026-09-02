@@ -5,6 +5,7 @@ safe deletion, duplicate group dismissal, network info, and API endpoints.
 """
 
 import os
+import sys
 import shutil
 import tempfile
 import sqlite3
@@ -12,6 +13,8 @@ import numpy as np
 from PIL import Image
 import piexif
 from fastapi.testclient import TestClient
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.database import init_db, get_connection, upsert_photo, get_photos, get_duplicate_groups, get_stats
 from backend.metadata_extractor import extract_metadata, calculate_sha256, calculate_perceptual_hashes
@@ -119,6 +122,10 @@ def run_tests():
         print("[PASS] Classifier: Accurately differentiated Real Camera Photo vs Screenshot vs System Asset")
 
         # Step 4: Test Database Operations & Deduplication
+        import backend.database
+        import backend.app
+        backend.database.DB_PATH = test_db
+        backend.app.DB_PATH = test_db
         init_db(test_db)
         
         p1_id = upsert_photo({**cam_meta, "classification": cam_class, "classification_score": cam_score, "indexed_at": 1000}, test_db)
@@ -135,7 +142,7 @@ def run_tests():
 
         # Step 5: Test Non-destructive Thumbnail Generation
         thumb_path = generate_thumbnail(samples["cam_photo"], p1_id, "thumb")
-        assert os.path.exists(thumb_path), "Thumbnail file was not created"
+        assert thumb_path is not None and os.path.exists(thumb_path), "Thumbnail file was not created"
         with Image.open(thumb_path) as t_img:
             assert t_img.width <= 320 and t_img.height <= 320, "Thumbnail dimension exceeds 320"
         print("[PASS] Thumbnail Generator: Generated fast WebP cached preview", flush=True)
@@ -169,6 +176,121 @@ def run_tests():
         assert del_res.status_code == 200, f"Delete failed: {del_res.text}"
         assert not os.path.exists(disp_path), "File was not deleted from disk"
         print("[PASS] Safe Deletion API: Deleted file safely and purged record from catalog", flush=True)
+
+        # Step 9: Test Trash Tagging (Deferred Deletion / File Preservation)
+        trash_sample_path = os.path.join(test_dir, "trash_candidate.jpg")
+        shutil.copy2(samples["cam_photo"], trash_sample_path)
+        trash_meta = extract_metadata(trash_sample_path)
+        trash_pid = upsert_photo({**trash_meta, "classification": "VERIFIED_PHOTO", "indexed_at": 1010})
+
+        # Tag for trash
+        tag_res = client.post(f"/api/photos/{trash_pid}/trash", json={"is_trashed": True})
+        assert tag_res.status_code == 200, f"Tag trash failed: {tag_res.text}"
+        assert tag_res.json()["is_trashed"] is True
+        # Verify file is preserved intact on disk
+        assert os.path.exists(trash_sample_path), "File should be preserved on disk when tagged for trash"
+
+        # Verify default list_photos excludes trashed photos
+        list_res = client.get("/api/photos")
+        pids = [p["id"] for p in list_res.json()["photos"]]
+        assert trash_pid not in pids, "Trashed photo should not appear in default photo gallery"
+
+        # Verify trash listing endpoint
+        trash_list_res = client.get("/api/trash")
+        assert trash_list_res.status_code == 200
+        trash_pids = [p["id"] for p in trash_list_res.json()["photos"]]
+        assert trash_pid in trash_pids, "Trashed photo must appear in /api/trash"
+        print("[PASS] Trash Tagging: Photo tagged for trash, file preserved intact on disk and filtered from active gallery", flush=True)
+
+        # Step 10: Test Space-Triggered Auto-Purge & Notification Message
+        purge_res = client.post("/api/trash/purge-for-space", json={"force_purge_count": 1})
+        assert purge_res.status_code == 200, f"Purge for space failed: {purge_res.text}"
+        purge_data = purge_res.json()
+        assert purge_data["purged"] is True, "Expected purged=True on space reclamation"
+        assert purge_data["count"] >= 1, "Expected at least 1 photo purged"
+        assert not os.path.exists(trash_sample_path), "File should be permanently deleted on disk after space purge"
+        assert "CRITICAL DISK SPACE NOTICE" in purge_data["message"], f"Expected notice in message, got {purge_data['message']}"
+        
+        # Verify purge audit logs
+        logs_res = client.get("/api/trash/purge-logs")
+        assert logs_res.status_code == 200
+        logs = logs_res.json()["logs"]
+        assert len(logs) >= 1, "Expected at least 1 purge log entry"
+        assert logs[0]["reason"] == "LOW_DISK_SPACE"
+        print(f"[PASS] Disk Space Auto-Purge: Permanently deleted file on disk and generated mandatory notification: '{purge_data['message'][:60]}...'", flush=True)
+
+        # Step 11: Test Duplicate Trashing Flow (Batch and Single)
+        dup_test_1 = os.path.join(test_dir, "dup_orig.jpg")
+        dup_test_2 = os.path.join(test_dir, "dup_copy.jpg")
+        shutil.copy2(samples["cam_photo"], dup_test_1)
+        shutil.copy2(samples["cam_photo"], dup_test_2)
+        m1 = extract_metadata(dup_test_1)
+        m2 = extract_metadata(dup_test_2)
+        d_p1 = upsert_photo({**m1, "classification": "VERIFIED_PHOTO", "indexed_at": 2001})
+        d_p2 = upsert_photo({**m2, "classification": "VERIFIED_PHOTO", "indexed_at": 2002})
+        run_deduplication_pass()
+        
+        # Verify duplicate group was found
+        groups_res = client.get("/api/duplicates")
+        assert groups_res.status_code == 200
+        dup_groups_before = groups_res.json()
+        assert len(dup_groups_before) >= 1, "Expected duplicate group before trash"
+        
+        # Trash all duplicates
+        trash_dups_res = client.post("/api/duplicates/trash-all")
+        assert trash_dups_res.status_code == 200
+        trash_dups_data = trash_dups_res.json()
+        assert trash_dups_data["count"] >= 1, f"Expected at least 1 duplicate trashed, got {trash_dups_data}"
+
+        # Verify duplicate group list is now empty/resolved
+        groups_after = client.get("/api/duplicates").json()
+        assert len(groups_after) == 0, f"Expected 0 duplicate groups after trashing, got {len(groups_after)}"
+
+        # Verify file is still physically on disk (non-destructive)
+        assert os.path.exists(dup_test_2), "Duplicate copy must remain preserved on disk in Trash state"
+        print("[PASS] Duplicate Trashing: Successfully moved duplicate copies to Trash, preserved primary original, and updated duplicate inspector", flush=True)
+
+        # Step 12: Test Compare Studio Selective Batch Trashing & Group Reconciliation
+        trip_base = os.path.join(test_dir, "trip_base.jpg")
+        Image.new("RGB", (1400, 1000), color=(12, 140, 240)).save(trip_base, "jpeg")
+        trip_1 = os.path.join(test_dir, "trip_1.jpg")
+        trip_2 = os.path.join(test_dir, "trip_2.jpg")
+        trip_3 = os.path.join(test_dir, "trip_3.jpg")
+        shutil.copy2(trip_base, trip_1)
+        shutil.copy2(trip_base, trip_2)
+        shutil.copy2(trip_base, trip_3)
+        t_m1 = extract_metadata(trip_1)
+        t_m2 = extract_metadata(trip_2)
+        t_m3 = extract_metadata(trip_3)
+        tp1 = upsert_photo({**t_m1, "classification": "VERIFIED_PHOTO", "indexed_at": 3001})
+        tp2 = upsert_photo({**t_m2, "classification": "VERIFIED_PHOTO", "indexed_at": 3002})
+        tp3 = upsert_photo({**t_m3, "classification": "VERIFIED_PHOTO", "indexed_at": 3003})
+        run_deduplication_pass()
+
+        groups_res = client.get("/api/duplicates")
+        assert groups_res.status_code == 200
+        trip_group = next(
+            (g for g in groups_res.json() if any(item["id"] == tp1 for item in [g["primary"], *g["duplicates"]])),
+            None
+        )
+        assert trip_group is not None, "Expected triplet group to be formed"
+        assert trip_group["total_items"] == 3
+
+        # User compares group and selectively trashes only 1 of the duplicates (tp2)
+        batch_res = client.post("/api/photos/batch-trash", json={"photo_ids": [tp2], "is_trashed": True})
+        assert batch_res.status_code == 200
+
+        # Verify group is reconciled to 2 items (user kept more than 1)
+        groups_after_partial = client.get("/api/duplicates").json()
+        reconciled_group = next((g for g in groups_after_partial if g["group_id"] == trip_group["group_id"]), None)
+        assert reconciled_group is not None, "Group should still exist with 2 remaining photos"
+        assert reconciled_group["total_items"] == 2
+
+        # User subsequently trashes tp3, leaving only 1 photo: group should auto-resolve
+        client.post("/api/photos/batch-trash", json={"photo_ids": [tp3], "is_trashed": True})
+        groups_after_final = client.get("/api/duplicates").json()
+        assert not any(g["group_id"] == trip_group["group_id"] for g in groups_after_final), "Group should be resolved after keeping 1 photo"
+        print("[PASS] Selective Duplicate Shootout: Successfully reconciled partial duplicate group trashing and auto-resolved on single keeper", flush=True)
 
         print("\n*** ALL UNIT & INTEGRATION TESTS PASSED PERFECTLY! ***\n", flush=True)
 

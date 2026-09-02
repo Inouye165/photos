@@ -46,48 +46,64 @@ def calculate_perceptual_hashes(img: Image.Image) -> Tuple[Optional[str], Option
     except Exception:
         return None, None
 
-def _convert_to_degrees(value) -> Optional[float]:
+def _convert_to_degrees(value: Any) -> Optional[float]:
     """Helper to convert GPS rational coordinates (degrees, minutes, seconds) to decimal float."""
     try:
-        if isinstance(value, (tuple, list)) and len(value) >= 3:
-            d = float(value[0])
-            m = float(value[1])
-            s = float(value[2])
-            return d + (m / 60.0) + (s / 3600.0)
+        if isinstance(value, (tuple, list)):
+            if len(value) >= 3:
+                d = float(value[0])
+                m = float(value[1])
+                s = float(value[2])
+                return d + (m / 60.0) + (s / 3600.0)
+            elif len(value) == 1:
+                return float(value[0])
+            return None
         return float(value)
     except Exception:
         return None
 
-def extract_gps_info(exif_data: Dict[int, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Extracts decimal latitude, longitude, and altitude from EXIF GPSInfo tag (34853)."""
-    gps_info = exif_data.get(34853)
-    if not gps_info or not isinstance(gps_info, dict):
+def extract_gps_info(gps_data: Dict[Any, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Extracts decimal latitude, longitude, and altitude from GPS IFD or EXIF dictionary."""
+    if not gps_data or not isinstance(gps_data, dict):
         return None, None, None
+
+    # If caller passed full EXIF dict containing GPS tag (34853)
+    if 34853 in gps_data and isinstance(gps_data[34853], dict):
+        gps_info = gps_data[34853]
+    else:
+        gps_info = gps_data
 
     lat = None
     lon = None
     alt = None
 
     # GPS Tag IDs: 1: LatRef, 2: Lat, 3: LonRef, 4: Lon, 5: AltRef, 6: Alt
-    lat_val = gps_info.get(2)
-    lat_ref = gps_info.get(1)
-    lon_val = gps_info.get(4)
-    lon_ref = gps_info.get(3)
-    alt_val = gps_info.get(6)
+    lat_val = gps_info.get(2) or gps_info.get("GPSLatitude")
+    lat_ref = gps_info.get(1) or gps_info.get("GPSLatitudeRef")
+    lon_val = gps_info.get(4) or gps_info.get("GPSLongitude")
+    lon_ref = gps_info.get(3) or gps_info.get("GPSLongitudeRef")
+    alt_val = gps_info.get(6) or gps_info.get("GPSAltitude")
+    alt_ref = gps_info.get(5) or gps_info.get("GPSAltitudeRef")
 
-    if lat_val:
+    if lat_val is not None:
         lat = _convert_to_degrees(lat_val)
-        if lat is not None and lat_ref and str(lat_ref).upper().startswith("S"):
-            lat = -lat
+        if lat is not None and lat_ref:
+            ref_str = lat_ref.decode("utf-8", errors="ignore") if isinstance(lat_ref, bytes) else str(lat_ref)
+            if ref_str.upper().startswith("S"):
+                lat = -abs(lat)
 
-    if lon_val:
+    if lon_val is not None:
         lon = _convert_to_degrees(lon_val)
-        if lon is not None and lon_ref and str(lon_ref).upper().startswith("W"):
-            lon = -lon
+        if lon is not None and lon_ref:
+            ref_str = lon_ref.decode("utf-8", errors="ignore") if isinstance(lon_ref, bytes) else str(lon_ref)
+            if ref_str.upper().startswith("W"):
+                lon = -abs(lon)
 
-    if alt_val:
+    if alt_val is not None:
         try:
             alt = float(alt_val)
+            if alt_ref and (alt_ref == 1 or alt_ref == b'\x01' or str(alt_ref) == "1"):
+                alt = -abs(alt)
         except Exception:
             alt = None
 
@@ -122,7 +138,7 @@ def extract_metadata(file_path: str) -> Dict[str, Any]:
         "file_name": file_name,
         "file_size": file_size,
         "file_extension": ext_lower,
-        "file_created_at": stat.st_ctime,
+        "file_created_at": getattr(stat, "st_birthtime", stat.st_mtime),
         "file_modified_at": stat.st_mtime,
         "sha256": calculate_sha256(file_path),
         "width": None,
@@ -168,68 +184,123 @@ def extract_metadata(file_path: str) -> Dict[str, Any]:
             result["phash"] = ph
             result["dhash"] = dh
 
-            # Extract EXIF dictionary
+            # Extract EXIF tags across both modern Pillow (getexif / IFDs) and legacy (_getexif)
             raw_exif_dict = {}
-            exif = img._getexif() if hasattr(img, "_getexif") and callable(img._getexif) else None
+            combined_tags: Dict[str, Any] = {}
+            gps_ifd: Dict[Any, Any] = {}
 
-            if exif and isinstance(exif, dict):
-                for tag_id, value in exif.items():
+            exif_obj = None
+            if hasattr(img, "getexif"):
+                try:
+                    exif_obj = img.getexif()
+                except Exception:
+                    exif_obj = None
+
+            if exif_obj:
+                for tag_id, value in exif_obj.items():
                     tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
-                    # Sanitize non-serializable binary values
-                    if isinstance(value, bytes):
-                        try:
-                            value_str = value.decode("utf-8", errors="ignore").strip().replace("\x00", "")
-                        except Exception:
-                            value_str = f"<bytes {len(value)}>"
-                    else:
-                        value_str = str(value).strip().replace("\x00", "")
-                    
-                    raw_exif_dict[tag_name] = value_str
+                    combined_tags[tag_name] = value
 
-                    # Map standard EXIF fields
-                    if tag_name in ("Make", "make"):
-                        result["camera_make"] = value_str
-                    elif tag_name in ("Model", "model"):
-                        result["camera_model"] = value_str
-                    elif tag_name in ("LensModel", "LensInfo", "Lens"):
-                        result["lens_model"] = value_str
-                    elif tag_name in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
-                        if not result["date_taken"]:
-                            result["date_taken"] = parse_exif_date(value_str)
-                    elif tag_name == "FocalLength":
-                        try:
-                            result["focal_length"] = round(float(value), 2)
-                        except Exception:
-                            pass
-                    elif tag_name == "FNumber":
-                        try:
-                            result["f_number"] = round(float(value), 2)
-                        except Exception:
-                            pass
-                    elif tag_name == "ExposureTime":
-                        result["exposure_time"] = str(value_str)
-                    elif tag_name in ("ISOSpeedRatings", "PhotographicSensitivity", "ISO"):
-                        try:
-                            result["iso"] = int(value)
-                        except Exception:
-                            pass
-                    elif tag_name == "Flash":
-                        result["flash"] = str(value_str)
-                    elif tag_name == "Orientation":
-                        try:
-                            result["orientation"] = int(value)
-                        except Exception:
-                            pass
-                    elif tag_name in ("Software", "software"):
-                        result["software"] = value_str
+                # Exif sub-IFD (tag 34665)
+                if hasattr(ExifTags, "IFD") and hasattr(ExifTags.IFD, "Exif"):
+                    try:
+                        exif_sub = exif_obj.get_ifd(ExifTags.IFD.Exif)
+                        for tag_id, value in exif_sub.items():
+                            tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                            combined_tags[tag_name] = value
+                    except Exception:
+                        pass
+                elif hasattr(exif_obj, "get_ifd"):
+                    try:
+                        exif_sub = exif_obj.get_ifd(34665)
+                        for tag_id, value in exif_sub.items():
+                            tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                            combined_tags[tag_name] = value
+                    except Exception:
+                        pass
 
-                # Extract GPS
-                lat, lon, alt = extract_gps_info(exif)
-                result["latitude"] = lat
-                result["longitude"] = lon
-                result["altitude"] = alt
+                # GPS sub-IFD (tag 34853)
+                if hasattr(ExifTags, "IFD") and hasattr(ExifTags.IFD, "GPSInfo"):
+                    try:
+                        gps_ifd = dict(exif_obj.get_ifd(ExifTags.IFD.GPSInfo))
+                    except Exception:
+                        pass
+                elif hasattr(exif_obj, "get_ifd"):
+                    try:
+                        gps_ifd = dict(exif_obj.get_ifd(34853))
+                    except Exception:
+                        pass
 
-                result["raw_exif_json"] = json.dumps(raw_exif_dict)
+            # Legacy _getexif fallback if needed
+            if not combined_tags and hasattr(img, "_getexif"):
+                legacy_exif = getattr(img, "_getexif", lambda: None)()
+                if legacy_exif and isinstance(legacy_exif, dict):
+                    for tag_id, value in legacy_exif.items():
+                        tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                        combined_tags[tag_name] = value
+                        if tag_id == 34853 and isinstance(value, dict):
+                            gps_ifd = value
+
+            # Fallback for GPS if embedded in combined_tags
+            if not gps_ifd:
+                if isinstance(combined_tags.get("34853"), dict):
+                    gps_ifd = combined_tags["34853"]
+                elif isinstance(combined_tags.get("GPSInfo"), dict):
+                    gps_ifd = combined_tags["GPSInfo"]
+
+            for tag_name, value in combined_tags.items():
+                if isinstance(value, bytes):
+                    try:
+                        value_str = value.decode("utf-8", errors="ignore").strip().replace("\x00", "")
+                    except Exception:
+                        value_str = f"<bytes {len(value)}>"
+                else:
+                    value_str = str(value).strip().replace("\x00", "")
+
+                raw_exif_dict[tag_name] = value_str
+
+                if tag_name in ("Make", "make") and not result["camera_make"]:
+                    result["camera_make"] = value_str
+                elif tag_name in ("Model", "model") and not result["camera_model"]:
+                    result["camera_model"] = value_str
+                elif tag_name in ("LensModel", "LensInfo", "Lens") and not result["lens_model"]:
+                    result["lens_model"] = value_str
+                elif tag_name in ("DateTimeOriginal", "DateTimeDigitized", "DateTime") and not result["date_taken"]:
+                    result["date_taken"] = parse_exif_date(value_str)
+                elif tag_name == "FocalLength" and result["focal_length"] is None:
+                    try:
+                        result["focal_length"] = round(float(value), 2)
+                    except Exception:
+                        pass
+                elif tag_name == "FNumber" and result["f_number"] is None:
+                    try:
+                        result["f_number"] = round(float(value), 2)
+                    except Exception:
+                        pass
+                elif tag_name == "ExposureTime" and not result["exposure_time"]:
+                    result["exposure_time"] = value_str
+                elif tag_name in ("ISOSpeedRatings", "PhotographicSensitivity", "ISO") and result["iso"] is None:
+                    try:
+                        result["iso"] = int(value)
+                    except Exception:
+                        pass
+                elif tag_name == "Flash" and not result["flash"]:
+                    result["flash"] = value_str
+                elif tag_name == "Orientation" and result["orientation"] == 1:
+                    try:
+                        result["orientation"] = int(value)
+                    except Exception:
+                        pass
+                elif tag_name in ("Software", "software") and not result["software"]:
+                    result["software"] = value_str
+
+            # Extract GPS
+            lat, lon, alt = extract_gps_info(gps_ifd)
+            result["latitude"] = lat
+            result["longitude"] = lon
+            result["altitude"] = alt
+
+            result["raw_exif_json"] = json.dumps(raw_exif_dict)
 
     except Exception as e:
         # If Pillow fails on special RAW or unhandled format, preserve basic file info

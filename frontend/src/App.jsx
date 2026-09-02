@@ -1,29 +1,59 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Header from './components/Header';
 import SemanticSearch from './components/SemanticSearch';
 import PhotoGrid from './components/PhotoGrid';
 import Lightbox from './components/Lightbox';
 import DuplicatesView from './components/DuplicatesView';
 import FilteredView from './components/FilteredView';
+import TrashView from './components/TrashView';
 import ScanModal from './components/ScanModal';
 import MobileConnectModal from './components/MobileConnectModal';
-import { fetchPhotos, fetchStats } from './api';
-import { Filter, SlidersHorizontal, MapPin, Eye, EyeOff, Sparkles, Copy, ShieldAlert, Smartphone } from 'lucide-react';
+import TimelineScrubber from './components/TimelineScrubber';
+import TrashSelectionBar from './components/TrashSelectionBar';
+import ConfirmTrashModal from './components/ConfirmTrashModal';
+import { fetchPhotos, fetchStats, tagPhotoTrash, batchTagTrash } from './api';
+import { Filter, SlidersHorizontal, MapPin, Eye, EyeOff, Sparkles, Copy, ShieldAlert, Smartphone, Calendar, Trash2, CheckSquare, CheckCircle2 } from 'lucide-react';
+
+const PAGE_SIZE = 80;
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('photos'); // 'photos', 'duplicates', 'filtered'
+  const [activeTab, setActiveTab] = useState('photos'); // 'photos', 'duplicates', 'filtered', 'trash'
   const [photos, setPhotos] = useState([]);
   const [totalPhotos, setTotalPhotos] = useState(0);
   const [stats, setStats] = useState(null);
   
   // Search & Filter state
   const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const [parsedQuery, setParsedQuery] = useState(null);
+  const [selectedYear, setSelectedYear] = useState(null);
   const [cameraMake, setCameraMake] = useState('');
   const [hasGps, setHasGps] = useState(null);
   const [includeDuplicates, setIncludeDuplicates] = useState(true);
+  const [includeTrashed, setIncludeTrashed] = useState(false);
   const [sortBy, setSortBy] = useState('date_taken');
   const [sortOrder, setSortOrder] = useState('DESC');
   const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+
+  // Abort controller ref for canceling in-flight search requests
+  const searchAbortRef = useRef(null);
+
+  // Debounce search query updates by 300ms to eliminate typing CPU spikes
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedQuery(query);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  // Multi-select / Select Mode for Trashing
+  const [isSelectMode, setIsSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false);
+  const [isTrashBatchLoading, setIsTrashBatchLoading] = useState(false);
+  const [toastMessage, setToastMessage] = useState(null);
 
   // Selected photo for Lightbox
   const [selectedPhoto, setSelectedPhoto] = useState(null);
@@ -38,43 +68,225 @@ export default function App() {
       .catch(console.error);
   }, []);
 
-  const loadPhotos = useCallback((searchQuery = query) => {
-    setIsLoading(true);
-    fetchPhotos({
-      query: searchQuery,
-      includeDuplicates,
-      cameraMake: cameraMake || null,
-      hasGps: hasGps,
-      sortBy,
-      sortOrder,
-      limit: 100,
-      offset: 0
-    })
-      .then((data) => {
-        setPhotos(data.photos || []);
-        setTotalPhotos(data.total || 0);
-        setIsLoading(false);
-      })
-      .catch((err) => {
-        console.error(err);
-        setIsLoading(false);
-      });
-  }, [query, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder]);
+  // Keyboard shortcut listener (Escape to cancel selection)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        if (isConfirmModalOpen) {
+          setIsConfirmModalOpen(false);
+        } else if (isSelectMode) {
+          setIsSelectMode(false);
+          setSelectedIds(new Set());
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isConfirmModalOpen, isSelectMode]);
 
+  // Selected photos list and total byte size calculation for modal
+  const selectedPhotosList = useMemo(() => {
+    if (selectedIds.size === 0) return [];
+    const idMap = new Map(photos.map((p) => [p.id, p]));
+    return Array.from(selectedIds)
+      .map((id) => idMap.get(id))
+      .filter(Boolean);
+  }, [photos, selectedIds]);
+
+  const totalSelectedBytes = useMemo(() => {
+    return selectedPhotosList.reduce((acc, p) => acc + (p.file_size || 0), 0);
+  }, [selectedPhotosList]);
+
+  const loadPhotos = useCallback((options = {}) => {
+    const isLoadMore = options.isLoadMore || false;
+    const searchQuery = options.searchQuery !== undefined ? options.searchQuery : debouncedQuery;
+    const yearFilter = options.year !== undefined ? options.year : selectedYear;
+
+    if (!isLoadMore) {
+      if (searchAbortRef.current) {
+        searchAbortRef.current.abort();
+      }
+      searchAbortRef.current = new AbortController();
+    }
+    const signal = !isLoadMore ? searchAbortRef.current?.signal : null;
+
+    if (isLoadMore) {
+      setIsLoadingMore(true);
+      fetchPhotos({
+        query: searchQuery,
+        year: yearFilter,
+        includeDuplicates,
+        cameraMake: cameraMake || null,
+        hasGps: hasGps,
+        sortBy,
+        sortOrder,
+        limit: PAGE_SIZE,
+        offset: photos.length,
+        knownTotal: totalPhotos,
+        signal
+      })
+        .then((data) => {
+          const newItems = data.photos || [];
+          setPhotos((prev) => [...prev, ...newItems]);
+          setTotalPhotos(data.total || 0);
+          setHasMore(photos.length + newItems.length < (data.total || 0));
+          setIsLoadingMore(false);
+        })
+        .catch((err) => {
+          if (err?.name === 'AbortError') return;
+          console.error('Error loading more photos:', err);
+          setIsLoadingMore(false);
+        });
+    } else {
+      setIsLoading(true);
+      fetchPhotos({
+        query: searchQuery,
+        year: yearFilter,
+        includeDuplicates,
+        cameraMake: cameraMake || null,
+        hasGps: hasGps,
+        sortBy,
+        sortOrder,
+        limit: PAGE_SIZE,
+        offset: 0,
+        signal
+      })
+        .then((data) => {
+          const items = data.photos || [];
+          setPhotos(items);
+          setTotalPhotos(data.total || 0);
+          setHasMore(items.length < (data.total || 0));
+          setParsedQuery(data.parsed_query || null);
+          setIsLoading(false);
+        })
+        .catch((err) => {
+          if (err?.name === 'AbortError') return;
+          console.error('Error loading photos:', err);
+          setIsLoading(false);
+        });
+    }
+  }, [debouncedQuery, selectedYear, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder, photos.length, totalPhotos]);
+
+  // Initial load or filter changes
   useEffect(() => {
     loadStats();
-    loadPhotos();
-  }, [loadStats, loadPhotos]);
+  }, [loadStats]);
+
+  useEffect(() => {
+    loadPhotos({ isLoadMore: false });
+  }, [debouncedQuery, selectedYear, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder]);
 
   const handleSearch = (searchQuery) => {
     setQuery(searchQuery);
-    loadPhotos(searchQuery);
+    setDebouncedQuery(searchQuery);
+    if (!searchQuery) {
+      setParsedQuery(null);
+    }
+  };
+
+  const handleSelectYear = (year) => {
+    setSelectedYear(year);
+  };
+
+  const handleLoadMore = () => {
+    if (!isLoadingMore && hasMore && !isLoading) {
+      loadPhotos({ isLoadMore: true });
+    }
   };
 
   const handleRefreshLibrary = useCallback(() => {
     loadStats();
-    loadPhotos();
+    loadPhotos({ isLoadMore: false });
   }, [loadStats, loadPhotos]);
+
+  // Quick scroll-time tagging for trash / entering Select Mode
+  const handleToggleTrashPhoto = async (photo, nextTrashed) => {
+    // Optimistic UI state update so scrolling is silky smooth
+    setPhotos((prev) =>
+      prev.map((p) => (p.id === photo.id ? { ...p, is_trashed: nextTrashed ? 1 : 0 } : p))
+    );
+    try {
+      await tagPhotoTrash(photo.id, nextTrashed);
+      loadStats();
+    } catch (err) {
+      console.error('Failed to update trash status:', err);
+      loadPhotos({ isLoadMore: false });
+    }
+  };
+
+  // Called when user clicks the quick trash button on a photo card
+  const handleStartTrashSelect = (photo) => {
+    if (photo.is_trashed) {
+      // If already tagged for trash, restore it directly
+      handleToggleTrashPhoto(photo, false);
+    } else {
+      // Enter Select Mode and immediately select this photo
+      setIsSelectMode(true);
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        next.add(photo.id);
+        return next;
+      });
+    }
+  };
+
+  // Toggle selection for a photo while in Select Mode
+  const handleToggleSelectPhoto = (photo) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(photo.id)) {
+        next.delete(photo.id);
+      } else {
+        next.add(photo.id);
+      }
+      return next;
+    });
+  };
+
+  // Select all visible photos
+  const handleSelectAllVisible = () => {
+    setSelectedIds(new Set(photos.map((p) => p.id)));
+  };
+
+  // Deselect all
+  const handleDeselectAll = () => {
+    setSelectedIds(new Set());
+  };
+
+  // Exit Select Mode
+  const handleExitSelectMode = () => {
+    setIsSelectMode(false);
+    setSelectedIds(new Set());
+  };
+
+  // Confirm and execute batch moving selected photos to trash
+  const handleConfirmBatchTrash = async () => {
+    if (selectedIds.size === 0) return;
+    const idsToTrash = Array.from(selectedIds);
+    setIsTrashBatchLoading(true);
+    try {
+      await batchTagTrash(idsToTrash, true);
+
+      // Optimistic UI update
+      setPhotos((prev) =>
+        prev.map((p) => (selectedIds.has(p.id) ? { ...p, is_trashed: 1 } : p))
+      );
+
+      const count = idsToTrash.length;
+      setIsConfirmModalOpen(false);
+      setIsSelectMode(false);
+      setSelectedIds(new Set());
+      loadStats();
+
+      setToastMessage(`Moved ${count} photo${count === 1 ? '' : 's'} to trash`);
+      setTimeout(() => setToastMessage(null), 4000);
+    } catch (err) {
+      console.error('Failed to batch trash photos:', err);
+      alert('Failed to move selected photos to trash: ' + err.message);
+    } finally {
+      setIsTrashBatchLoading(false);
+    }
+  };
 
   return (
     <div className="app-container">
@@ -84,10 +296,30 @@ export default function App() {
         <div className="ambient-orb-2" />
       </div>
 
+      {/* Toast notification banner */}
+      {toastMessage && (
+        <div className="toast-notification">
+          <CheckCircle2 size={16} color="#10b981" />
+          <span>{toastMessage}</span>
+          <button
+            className="toast-btn-action"
+            onClick={() => {
+              setActiveTab('trash');
+              setToastMessage(null);
+            }}
+          >
+            View Trash
+          </button>
+        </div>
+      )}
+
       {/* Header */}
       <Header
         activeTab={activeTab}
-        setActiveTab={setActiveTab}
+        setActiveTab={(tab) => {
+          if (isSelectMode) handleExitSelectMode();
+          setActiveTab(tab);
+        }}
         stats={stats}
         onOpenScanModal={() => setIsScanModalOpen(true)}
         onOpenMobileModal={() => setIsMobileModalOpen(true)}
@@ -104,6 +336,15 @@ export default function App() {
               setQuery={setQuery}
               onSearch={handleSearch}
               isLoading={isLoading}
+              parsedQuery={parsedQuery}
+            />
+
+            {/* Timeline Scrubber */}
+            <TimelineScrubber
+              timelineYears={stats?.timeline_years || []}
+              selectedYear={selectedYear}
+              onSelectYear={handleSelectYear}
+              totalPhotos={stats?.total_photos || totalPhotos}
             />
 
             {/* Filter and sorting controls */}
@@ -156,8 +397,25 @@ export default function App() {
                 </label>
               </div>
 
-              {/* Sort Order */}
+              {/* Sort Order & Multi-Select Toggle */}
               <div className="filter-group">
+                {/* Manual Select Mode Toggle */}
+                <button
+                  type="button"
+                  className={`btn-select-mode-toggle ${isSelectMode ? 'active' : ''}`}
+                  onClick={() => {
+                    if (isSelectMode) {
+                      handleExitSelectMode();
+                    } else {
+                      setIsSelectMode(true);
+                    }
+                  }}
+                  title={isSelectMode ? 'Exit Select Mode (Esc)' : 'Enter multi-select mode to mark multiple photos for deletion/trash'}
+                >
+                  <CheckSquare size={14} />
+                  <span>{isSelectMode ? 'Exit Select' : 'Select Mode'}</span>
+                </button>
+
                 <span style={{ fontSize: '0.825rem', color: '#94a3b8' }}>Sort:</span>
                 <select
                   className="select-styled"
@@ -179,9 +437,18 @@ export default function App() {
             {/* Photo Grid */}
             <PhotoGrid
               photos={photos}
+              totalPhotos={totalPhotos}
               onSelectPhoto={(photo) => setSelectedPhoto(photo)}
+              onToggleTrash={handleToggleTrashPhoto}
+              onStartTrashSelect={handleStartTrashSelect}
+              isSelectMode={isSelectMode}
+              selectedIds={selectedIds}
+              onToggleSelectPhoto={handleToggleSelectPhoto}
               query={query}
               isLoading={isLoading}
+              isLoadingMore={isLoadingMore}
+              hasMore={hasMore}
+              onLoadMore={handleLoadMore}
             />
           </>
         )}
@@ -197,6 +464,13 @@ export default function App() {
           <FilteredView
             onSelectPhoto={(photo) => setSelectedPhoto(photo)}
             onRefreshStats={handleRefreshLibrary}
+          />
+        )}
+
+        {activeTab === 'trash' && (
+          <TrashView
+            onSelectPhoto={(photo) => setSelectedPhoto(photo)}
+            onLibraryUpdated={handleRefreshLibrary}
           />
         )}
       </main>
@@ -228,6 +502,14 @@ export default function App() {
         </button>
 
         <button
+          className={`mobile-nav-item ${activeTab === 'trash' ? 'active' : ''}`}
+          onClick={() => setActiveTab('trash')}
+        >
+          <Trash2 size={20} />
+          <span>Trash</span>
+        </button>
+
+        <button
           className="mobile-nav-item"
           onClick={() => setIsMobileModalOpen(true)}
         >
@@ -236,6 +518,28 @@ export default function App() {
         </button>
       </div>
 
+      {/* Floating Batch Selection Bar */}
+      {isSelectMode && activeTab === 'photos' && (
+        <TrashSelectionBar
+          selectedCount={selectedIds.size}
+          totalVisible={photos.length}
+          onSelectAll={handleSelectAllVisible}
+          onDeselectAll={handleDeselectAll}
+          onOpenConfirm={() => setIsConfirmModalOpen(true)}
+          onCancel={handleExitSelectMode}
+          totalBytes={totalSelectedBytes}
+        />
+      )}
+
+      {/* Confirmation Modal for moving selected photos to trash */}
+      <ConfirmTrashModal
+        isOpen={isConfirmModalOpen}
+        onClose={() => setIsConfirmModalOpen(false)}
+        onConfirm={handleConfirmBatchTrash}
+        selectedPhotos={selectedPhotosList}
+        isLoading={isTrashBatchLoading}
+      />
+
       {/* Lightbox / EXIF Inspector Modal */}
       {selectedPhoto && (
         <Lightbox
@@ -243,6 +547,7 @@ export default function App() {
           onClose={() => setSelectedPhoto(null)}
           onReclassifySuccess={handleRefreshLibrary}
           onPhotoDeleted={handleRefreshLibrary}
+          onTrashStatusChanged={handleRefreshLibrary}
         />
       )}
 
@@ -261,3 +566,4 @@ export default function App() {
     </div>
   );
 }
+

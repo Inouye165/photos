@@ -1,18 +1,17 @@
 import React from 'react';
-import { Search, Sparkles, X, Compass } from 'lucide-react';
+import { Search, Sparkles, X, Compass, Calendar, Folder, User, Eye, AlertCircle, ShieldCheck } from 'lucide-react';
 
 const SUGGESTED_PROMPTS = [
-  'Sunset over the ocean',
-  'Dog or pet portrait',
-  'Birthday cake with candles',
-  'Mountain landscape',
+  'Photos of Dobby at the beach',
+  'Dobby playing in the grass',
+  'Sunset over the ocean summer 2024',
+  'Birthday party with cake',
+  'Mountain hiking trip',
   'Snowy winter trees',
-  'Night city skyline',
-  'Delicious restaurant food',
-  'Vintage car on the road'
+  'Screenshots from last year'
 ];
 
-export default function SemanticSearch({ query, setQuery, onSearch, isLoading }) {
+export default function SemanticSearch({ query, setQuery, onSearch, isLoading, parsedQuery }) {
   const handleSubmit = (e) => {
     e.preventDefault();
     onSearch(query);
@@ -28,6 +27,14 @@ export default function SemanticSearch({ query, setQuery, onSearch, isLoading })
     onSearch('');
   };
 
+  const hasFacets = parsedQuery && query && (
+    parsedQuery.visual_prompt ||
+    (parsedQuery.entities && parsedQuery.entities.length > 0) ||
+    (parsedQuery.folder_keywords && parsedQuery.folder_keywords.length > 0) ||
+    parsedQuery.date_label ||
+    parsedQuery.classification
+  );
+
   return (
     <div className="search-hero">
       <div className="search-box-wrapper">
@@ -36,7 +43,7 @@ export default function SemanticSearch({ query, setQuery, onSearch, isLoading })
           <input
             type="text"
             className="search-input"
-            placeholder="Search photos semantically (e.g., 'sunset on the beach', 'happy dog in grass', 'birthday party')..."
+            placeholder="Ask naturally (e.g., 'photos of dobby at the beach', 'sunset summer 2024', 'screenshots last year')..."
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
@@ -59,10 +66,58 @@ export default function SemanticSearch({ query, setQuery, onSearch, isLoading })
           )}
           <div className="search-ai-tag">
             <Sparkles size={13} />
-            <span>CLIP 512D</span>
+            <span>Hybrid NL Search</span>
           </div>
         </form>
       </div>
+
+      {/* Smart Query Interpretation Facets */}
+      {hasFacets && (
+        <div className="search-facets-bar">
+          {parsedQuery.visual_prompt && (
+            <span className="facet-pill facet-pill-visual" title="Visual concept searched by CLIP model">
+              <Eye size={12} />
+              <span>Scene: "{parsedQuery.visual_prompt}"</span>
+            </span>
+          )}
+
+          {parsedQuery.entities && parsedQuery.entities.map((ent, i) => (
+            <span key={i} className="facet-pill facet-pill-entity" title={`Identified subject: ${ent.type}`}>
+              <User size={12} />
+              <span>{ent.name} ({ent.type})</span>
+            </span>
+          ))}
+
+          {parsedQuery.folder_keywords && parsedQuery.folder_keywords.map((kw, i) => (
+            <span key={i} className="facet-pill facet-pill-folder" title="Matched album / folder">
+              <Folder size={12} />
+              <span>Folder: {kw}</span>
+            </span>
+          ))}
+
+          {parsedQuery.date_label && (
+            <span className="facet-pill facet-pill-date" title="Parsed EXIF date filter">
+              <Calendar size={12} />
+              <span>Date: {parsedQuery.date_label}</span>
+            </span>
+          )}
+
+          {parsedQuery.classification && (
+            <span className="facet-pill facet-pill-filter" title="Classification target">
+              <ShieldCheck size={12} />
+              <span>{parsedQuery.classification === 'SCREENSHOT' ? 'Screenshots' : 'Real Photos Only'}</span>
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Fallback / Date Relaxation Banner */}
+      {parsedQuery?.fallback_applied && parsedQuery?.fallback_message && (
+        <div className="search-fallback-banner">
+          <AlertCircle size={17} color="#f59e0b" style={{ flexShrink: 0 }} />
+          <span>{parsedQuery.fallback_message}</span>
+        </div>
+      )}
 
       {/* Suggested Quick Prompts */}
       <div className="quick-prompts">
