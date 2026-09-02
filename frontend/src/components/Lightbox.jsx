@@ -12,11 +12,12 @@ import {
   ShieldCheck,
   Tag,
   Trash2,
-  AlertTriangle
+  AlertTriangle,
+  RotateCcw
 } from 'lucide-react';
-import { fetchPhotoDetails, reclassifyPhoto, deletePhoto } from '../api';
+import { fetchPhotoDetails, reclassifyPhoto, deletePhoto, tagPhotoTrash } from '../api';
 
-export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoDeleted }) {
+export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoDeleted, onTrashStatusChanged }) {
   const [details, setDetails] = useState(photo);
   const [loading, setLoading] = useState(true);
   const [isUpdating, setIsUpdating] = useState(false);
@@ -38,6 +39,7 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
 
   if (!photo) return null;
 
+  const isTrashed = Boolean(details.is_trashed);
   const previewUrl = `/api/photos/${photo.id}/preview`;
   const originalUrl = `/api/photos/${photo.id}/original`;
 
@@ -45,6 +47,20 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
     if (!bytes) return 'Unknown';
     const mb = bytes / (1024 * 1024);
     return mb >= 1 ? `${mb.toFixed(2)} MB (${bytes.toLocaleString()} bytes)` : `${(bytes / 1024).toFixed(1)} KB`;
+  };
+
+  const handleToggleTrash = async () => {
+    try {
+      setIsUpdating(true);
+      const nextTrashed = !isTrashed;
+      await tagPhotoTrash(photo.id, nextTrashed);
+      setDetails((prev) => ({ ...prev, is_trashed: nextTrashed ? 1 : 0 }));
+      if (onTrashStatusChanged) onTrashStatusChanged();
+    } catch (e) {
+      alert('Failed to update trash status: ' + e.message);
+    } finally {
+      setIsUpdating(false);
+    }
   };
 
   const handleReclassify = async (newClass) => {
@@ -99,17 +115,51 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
             }}>
               {details.classification?.replace('_', ' ')}
             </span>
+            {isTrashed && (
+              <span style={{
+                fontSize: '0.75rem',
+                padding: '2px 8px',
+                borderRadius: '9999px',
+                background: 'rgba(239, 68, 68, 0.25)',
+                color: '#fca5a5',
+                border: '1px solid rgba(239, 68, 68, 0.4)',
+                flexShrink: 0,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '4px'
+              }}>
+                <Trash2 size={11} />
+                <span>Tagged for Trash</span>
+              </span>
+            )}
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            {/* Tag / Restore Trash button */}
             <button
               className="btn-secondary"
-              style={{ fontSize: '0.8rem', padding: '0.4rem 0.75rem', color: '#fca5a5', borderColor: 'rgba(239, 68, 68, 0.3)' }}
+              style={{
+                fontSize: '0.8rem',
+                padding: '0.4rem 0.75rem',
+                color: isTrashed ? '#86efac' : '#fca5a5',
+                borderColor: isTrashed ? 'rgba(34, 197, 94, 0.3)' : 'rgba(239, 68, 68, 0.3)'
+              }}
+              onClick={handleToggleTrash}
+              disabled={isUpdating}
+              title={isTrashed ? 'Restore photo from trash' : 'Tag photo for trash (file remains intact)'}
+            >
+              {isTrashed ? <RotateCcw size={14} /> : <Trash2 size={14} />}
+              <span className="hide-on-mobile">{isTrashed ? 'Restore Photo' : 'Tag for Trash'}</span>
+            </button>
+
+            <button
+              className="btn-secondary"
+              style={{ fontSize: '0.8rem', padding: '0.4rem 0.75rem', color: '#94a3b8' }}
               onClick={() => setShowDeleteConfirm(true)}
-              title="Move file to Recycle Bin"
+              title="Immediately move file to Recycle Bin"
             >
               <Trash2 size={14} />
-              <span className="hide-on-mobile">Delete</span>
+              <span className="hide-on-mobile">Delete Now</span>
             </button>
 
             <a

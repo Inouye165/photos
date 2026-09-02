@@ -1,5 +1,5 @@
 import React from 'react';
-import { Camera, Copy, ShieldAlert, FolderSearch, Sparkles, RefreshCw, Smartphone } from 'lucide-react';
+import { Camera, Copy, ShieldAlert, FolderSearch, Sparkles, RefreshCw, Smartphone, Trash2 } from 'lucide-react';
 
 export default function Header({
   activeTab,
@@ -58,6 +58,19 @@ export default function Header({
           <span>Filtered Assets</span>
           {stats?.total_screenshots > 0 && (
             <span className="nav-badge">{stats.total_screenshots}</span>
+          )}
+        </button>
+
+        <button
+          className={`nav-tab-btn tab-trash ${activeTab === 'trash' ? 'active' : ''}`}
+          onClick={() => setActiveTab('trash')}
+        >
+          <Trash2 size={16} />
+          <span>Trash</span>
+          {stats?.total_trashed > 0 && (
+            <span className="nav-badge" style={{ background: 'rgba(239, 68, 68, 0.3)', color: '#fca5a5' }}>
+              {stats.total_trashed}
+            </span>
           )}
         </button>
       </nav>

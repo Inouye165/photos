@@ -6,20 +6,27 @@ Determines the optimal primary keeper based on resolution, metadata richness, an
 
 import uuid
 import sqlite3
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import imagehash
 from backend.database import get_connection, DB_PATH
+
+def fast_hamming(int1: int, int2: int) -> int:
+    """Computes bitwise Hamming distance between two pre-converted integer hashes in nanoseconds."""
+    return (int1 ^ int2).bit_count()
 
 def hamming_distance(hex_hash1: str, hex_hash2: str) -> int:
     """Computes Hamming distance between two hex perceptual hashes."""
     if not hex_hash1 or not hex_hash2 or len(hex_hash1) != len(hex_hash2):
         return 999
     try:
-        h1 = imagehash.hex_to_hash(hex_hash1)
-        h2 = imagehash.hex_to_hash(hex_hash2)
-        return int(h1 - h2)
+        return (int(hex_hash1, 16) ^ int(hex_hash2, 16)).bit_count()
     except Exception:
-        return 999
+        try:
+            h1 = imagehash.hex_to_hash(hex_hash1)
+            h2 = imagehash.hex_to_hash(hex_hash2)
+            return int(h1 - h2)
+        except Exception:
+            return 999
 
 def select_best_primary(photos: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -38,7 +45,7 @@ def select_best_primary(photos: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return max(photos, key=score_photo)
 
-def run_deduplication_pass(db_path: str = DB_PATH) -> int:
+def run_deduplication_pass(db_path: Optional[str] = None) -> int:
     """
     Performs full deduplication clustering across indexed photos:
     1. Exact match clustering via SHA-256.
@@ -61,7 +68,7 @@ def run_deduplication_pass(db_path: str = DB_PATH) -> int:
     cursor.execute("""
     SELECT sha256, COUNT(*) as count 
     FROM photos 
-    WHERE sha256 IS NOT NULL AND classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO')
+    WHERE sha256 IS NOT NULL AND classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO') AND is_trashed = 0
     GROUP BY sha256 
     HAVING count > 1
     """)
@@ -74,7 +81,7 @@ def run_deduplication_pass(db_path: str = DB_PATH) -> int:
         cursor.execute("""
         SELECT id, file_path, file_size, width, height, classification, date_taken, camera_make
         FROM photos 
-        WHERE sha256 = ?
+        WHERE sha256 = ? AND is_trashed = 0
         """, (sha,))
         members = [dict(r) for r in cursor.fetchall()]
         if len(members) <= 1:
@@ -108,23 +115,31 @@ def run_deduplication_pass(db_path: str = DB_PATH) -> int:
     cursor.execute("""
     SELECT id, file_path, file_size, width, height, classification, date_taken, camera_make, phash
     FROM photos 
-    WHERE phash IS NOT NULL AND duplicate_group_id IS NULL AND classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO')
+    WHERE phash IS NOT NULL AND duplicate_group_id IS NULL AND classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO') AND is_trashed = 0
     """)
-    phash_candidates = [dict(r) for r in cursor.fetchall()]
+    raw_phash_candidates = [dict(r) for r in cursor.fetchall()]
+
+    # Pre-parse hex hashes to integers for ultra-fast bitwise comparisons
+    phash_candidates = []
+    for r in raw_phash_candidates:
+        try:
+            phash_candidates.append((r, int(r["phash"], 16)))
+        except Exception:
+            pass
 
     visited_ids = set()
     for i in range(len(phash_candidates)):
-        p1 = phash_candidates[i]
+        p1, int1 = phash_candidates[i]
         if p1["id"] in visited_ids:
             continue
 
         cluster = [p1]
         for j in range(i + 1, len(phash_candidates)):
-            p2 = phash_candidates[j]
+            p2, int2 = phash_candidates[j]
             if p2["id"] in visited_ids:
                 continue
 
-            dist = hamming_distance(p1["phash"], p2["phash"])
+            dist = (int1 ^ int2).bit_count()
             if dist <= 6:  # Strict visual resemblance threshold
                 cluster.append(p2)
                 visited_ids.add(p2["id"])
@@ -154,3 +169,52 @@ def run_deduplication_pass(db_path: str = DB_PATH) -> int:
     conn.commit()
     conn.close()
     return created_groups_count
+
+def cleanup_duplicate_group(group_id: Optional[str], db_path: Optional[str] = None) -> None:
+    """
+    Incrementally reconciles a single duplicate group after photo deletion or trashing.
+    Runs in O(1) time without triggering an expensive full-library rescan.
+    """
+    if not group_id:
+        return
+    conn = get_connection(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, file_path, file_size, width, height, classification, date_taken, camera_make, is_primary
+        FROM photos
+        WHERE duplicate_group_id = ? AND is_trashed = 0
+    """, (group_id,))
+    remaining = [dict(r) for r in cursor.fetchall()]
+
+    if len(remaining) <= 1:
+        # 0 or 1 item left - no longer a duplicate group
+        cursor.execute("DELETE FROM duplicate_groups WHERE id = ?", (group_id,))
+        if len(remaining) == 1:
+            cursor.execute("""
+                UPDATE photos 
+                SET duplicate_group_id = NULL, is_primary = 1, duplicate_count = 0
+                WHERE id = ?
+            """, (remaining[0]["id"],))
+    else:
+        # Check if primary is still in remaining, else pick best primary
+        has_primary = any(m["is_primary"] for m in remaining)
+        primary = select_best_primary(remaining) if not has_primary else next(m for m in remaining if m["is_primary"])
+        primary_id = primary["id"]
+        wasted_bytes = sum(m["file_size"] for m in remaining if m["id"] != primary_id)
+        
+        cursor.execute("""
+            UPDATE duplicate_groups
+            SET primary_photo_id = ?, total_items = ?, total_wasted_bytes = ?
+            WHERE id = ?
+        """, (primary_id, len(remaining), wasted_bytes, group_id))
+
+        for m in remaining:
+            is_p = 1 if m["id"] == primary_id else 0
+            cursor.execute("""
+                UPDATE photos
+                SET is_primary = ?, duplicate_count = ?
+                WHERE id = ?
+            """, (is_p, len(remaining) - 1, m["id"]))
+
+    conn.commit()
+    conn.close()

@@ -27,8 +27,8 @@ def generate_thumbnail(file_path: str, photo_id: int, size_type: str = "thumb") 
     if os.path.exists(out_path):
         return out_path
 
-    max_dim = 320 if size_type == "thumb" else 1280
-    quality = 82 if size_type == "thumb" else 88
+    max_dim = 320 if size_type == "thumb" else (4096 if size_type == "full" else 1920)
+    quality = 82 if size_type == "thumb" else (92 if size_type == "full" else 88)
 
     try:
         with Image.open(file_path) as img:
