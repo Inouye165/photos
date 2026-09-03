@@ -103,7 +103,7 @@ const PhotoCard = React.memo(function PhotoCard({
           <span className="photo-card-camera">
             {photo.camera_model || photo.camera_make || (photo.width ? `${photo.width}×${photo.height}` : 'Photo')}
           </span>
-          <span>{formatDate(photo.date_taken)}</span>
+          <span>{formatDate(photo.date_taken || (photo.file_modified_at ? new Date(photo.file_modified_at * 1000).toISOString() : ''))}</span>
         </div>
       </div>
     </div>
@@ -168,20 +168,36 @@ export default function PhotoGrid({
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const getEffectiveDate = (photo) => {
+    if (!photo) return null;
+    if (photo.date_taken) return photo.date_taken;
+    if (photo.file_modified_at) {
+      try {
+        return new Date(photo.file_modified_at * 1000).toISOString();
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
+
   const formatDate = (isoString) => {
     if (!isoString) return '';
     try {
       const d = new Date(isoString);
+      if (isNaN(d.getTime())) return '';
       return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
     } catch {
       return '';
     }
   };
 
-  const formatMonthYear = (isoString) => {
-    if (!isoString) return 'Undated Photos';
+  const formatMonthYear = (photo) => {
+    const effective = getEffectiveDate(photo);
+    if (!effective) return 'Undated Photos';
     try {
-      const d = new Date(isoString);
+      const d = new Date(effective);
+      if (isNaN(d.getTime())) return 'Undated Photos';
       return d.toLocaleDateString(undefined, { year: 'numeric', month: 'long' });
     } catch {
       return 'Undated Photos';
@@ -199,7 +215,7 @@ export default function PhotoGrid({
     let currentItems = [];
 
     for (const photo of photos) {
-      const title = formatMonthYear(photo.date_taken);
+      const title = formatMonthYear(photo);
       if (title !== currentTitle) {
         if (currentItems.length > 0) {
           sections.push({ title: currentTitle, items: currentItems });

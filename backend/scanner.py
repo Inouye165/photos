@@ -7,6 +7,7 @@ and computes CLIP vector embeddings with real-time status reporting.
 import os
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Optional, Callable
 from backend.database import init_db, upsert_photo, get_connection, DB_PATH
 from backend.metadata_extractor import (
@@ -126,17 +127,10 @@ class ScanManager:
 
         newly_indexed_photos = []
 
-        # 2. Extract metadata, classify, and generate thumbnails
-        for fpath in all_candidate_files:
+        # 2. Extract metadata, classify, and generate thumbnails in parallel
+        def process_candidate(fpath: str):
             if self.should_stop:
-                with self._lock:
-                    self.stats["status"] = "STOPPED"
-                    self.is_scanning = False
-                return
-
-            with self._lock:
-                self.stats["current_file"] = os.path.basename(fpath)
-
+                return None
             try:
                 meta = extract_metadata(fpath)
                 classification, score, reason = classify_media(meta)
@@ -153,22 +147,44 @@ class ScanManager:
                     generate_thumbnail(fpath, photo_id, "thumb")
                     generate_thumbnail(fpath, photo_id, "preview")
 
-                if classification in ("VERIFIED_PHOTO", "LIKELY_PHOTO"):
-                    newly_indexed_photos.append((photo_id, fpath))
-                    with self._lock:
-                        self.stats["photos_count"] += 1
-                elif classification == "SCREENSHOT":
-                    with self._lock:
-                        self.stats["screenshots_count"] += 1
-                elif classification == "SYSTEM_ASSET":
-                    with self._lock:
-                        self.stats["system_assets_count"] += 1
+                return (photo_id, fpath, classification)
+            except Exception:
+                return None
 
-            except Exception as e:
-                pass
+        workers_count = max(2, min(8, (os.cpu_count() or 4)))
+        with ThreadPoolExecutor(max_workers=workers_count) as executor:
+            future_to_file = {executor.submit(process_candidate, f): f for f in all_candidate_files}
+            for future in as_completed(future_to_file):
+                if self.should_stop:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    with self._lock:
+                        self.stats["status"] = "STOPPED"
+                        self.is_scanning = False
+                    return
 
-            with self._lock:
-                self.stats["processed_count"] += 1
+                fpath = future_to_file[future]
+                fname = os.path.basename(fpath)
+
+                try:
+                    result = future.result()
+                    if result:
+                        pid, ppath, pclass = result
+                        if pclass in ("VERIFIED_PHOTO", "LIKELY_PHOTO"):
+                            newly_indexed_photos.append((pid, ppath))
+                            with self._lock:
+                                self.stats["photos_count"] += 1
+                        elif pclass == "SCREENSHOT":
+                            with self._lock:
+                                self.stats["screenshots_count"] += 1
+                        elif pclass == "SYSTEM_ASSET":
+                            with self._lock:
+                                self.stats["system_assets_count"] += 1
+                except Exception:
+                    pass
+
+                with self._lock:
+                    self.stats["current_file"] = fname
+                    self.stats["processed_count"] += 1
 
         # 3. Deduplication pass
         with self._lock:

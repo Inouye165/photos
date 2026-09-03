@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   X,
   Camera,
@@ -13,9 +13,14 @@ import {
   Tag,
   Trash2,
   AlertTriangle,
-  RotateCcw
+  RotateCcw,
+  User,
+  Heart,
+  Sparkles,
+  Plus
 } from 'lucide-react';
 import { fetchPhotoDetails, reclassifyPhoto, deletePhoto, tagPhotoTrash } from '../api';
+import BoundingBoxOverlay from './BoundingBoxOverlay';
 
 export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoDeleted, onTrashStatusChanged }) {
   const [details, setDetails] = useState(photo);
@@ -23,6 +28,18 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
   const [isUpdating, setIsUpdating] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showBoxes, setShowBoxes] = useState(true);
+  const [photoBoxes, setPhotoBoxes] = useState([]);
+  const [isDrawMode, setIsDrawMode] = useState(false);
+
+  const handleBoxesUpdated = useCallback((boxes) => {
+    if (Array.isArray(boxes)) {
+      setPhotoBoxes(boxes);
+    }
+  }, []);
+
+  const imageRef = useRef(null);
+  const previewContainerRef = useRef(null);
 
   useEffect(() => {
     if (!photo?.id) return;
@@ -173,6 +190,47 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
               <span className="hide-on-mobile">Original File</span>
             </a>
 
+            {/* People & Pets Bounding Box Toggle */}
+            <button
+              className={`btn-secondary ${showBoxes ? 'active-filter-btn' : ''}`}
+              style={{
+                fontSize: '0.8rem',
+                padding: '0.4rem 0.75rem',
+                borderColor: showBoxes ? '#6366f1' : 'rgba(255, 255, 255, 0.15)',
+                color: showBoxes ? '#c7d2fe' : '#94a3b8'
+              }}
+              onClick={() => setShowBoxes((prev) => !prev)}
+              title="Toggle People & Pets Bounding Boxes"
+            >
+              <User size={14} />
+              <span className="hide-on-mobile">{showBoxes ? 'Tags Visible' : 'Show Tags'}</span>
+              {photoBoxes.length > 0 && (
+                <span className="nav-badge" style={{ padding: '1px 6px', fontSize: '0.68rem', background: 'rgba(99, 102, 241, 0.3)' }}>
+                  {photoBoxes.length}
+                </span>
+              )}
+            </button>
+
+            {/* Manual Draw Tag Button */}
+            <button
+              className={`btn-secondary ${isDrawMode ? 'active-filter-btn' : ''}`}
+              style={{
+                fontSize: '0.8rem',
+                padding: '0.4rem 0.75rem',
+                borderColor: isDrawMode ? '#38bdf8' : 'rgba(56, 189, 248, 0.3)',
+                color: isDrawMode ? '#38bdf8' : '#7dd3fc',
+                background: isDrawMode ? 'rgba(56, 189, 248, 0.2)' : 'transparent'
+              }}
+              onClick={() => {
+                setShowBoxes(true);
+                setIsDrawMode((prev) => !prev);
+              }}
+              title="Add a person or pet tag manually by drawing a box"
+            >
+              <Plus size={14} />
+              <span className="hide-on-mobile">{isDrawMode ? 'Drawing...' : 'Add Tag'}</span>
+            </button>
+
             <button
               onClick={onClose}
               style={{
@@ -193,13 +251,28 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
           </div>
         </div>
 
-        {/* Center Preview Image */}
-        <div className="lightbox-preview-area">
+        {/* Center Preview Image with Bounding Box Overlay */}
+        <div
+          className="lightbox-preview-area"
+          ref={previewContainerRef}
+          style={{ position: 'relative' }}
+        >
           <img
+            ref={imageRef}
             src={previewUrl}
             alt={details.file_name}
             className="lightbox-image"
           />
+          {showBoxes && (
+            <BoundingBoxOverlay
+              photoId={photo.id}
+              imageRef={imageRef}
+              containerRef={previewContainerRef}
+              onBoxesUpdated={handleBoxesUpdated}
+              isDrawMode={isDrawMode}
+              setIsDrawMode={setIsDrawMode}
+            />
+          )}
         </div>
       </div>
 
@@ -210,6 +283,72 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
           <h3 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.1rem', color: '#ffffff' }}>
             EXIF & File Pointer
           </h3>
+        </div>
+
+        {/* People & Pets in this Photo */}
+        <div className="exif-block">
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#818cf8', fontSize: '0.85rem', fontWeight: 600 }}>
+              <User size={16} />
+              <span>People & Pets in Photo</span>
+            </div>
+            <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>
+              {photoBoxes.length} tagged
+            </span>
+          </div>
+
+          {photoBoxes.length === 0 ? (
+            <div style={{ fontSize: '0.78rem', color: '#64748b', fontStyle: 'italic', lineHeight: '1.4' }}>
+              No people or pets tagged yet. Click or drag a box on the photo to tag someone.
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              {photoBoxes.map((box) => (
+                <div
+                  key={box.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '6px 8px',
+                    borderRadius: '6px',
+                    background: 'rgba(255, 255, 255, 0.04)',
+                    border: '1px solid rgba(255, 255, 255, 0.08)'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <img
+                      src={`/api/boxes/${box.id}/crop`}
+                      alt="Crop"
+                      style={{ width: '28px', height: '28px', borderRadius: '50%', objectFit: 'cover' }}
+                      onError={(e) => { e.target.style.display = 'none'; }}
+                    />
+                    <div>
+                      <div style={{ fontSize: '0.82rem', fontWeight: 600, color: '#ffffff' }}>
+                        {box.entity_name || 'Unnamed Face'}
+                      </div>
+                      <div style={{ fontSize: '0.68rem', color: '#94a3b8' }}>
+                        {box.box_type === 'PET' ? 'Pet' : 'Person'}
+                      </div>
+                    </div>
+                  </div>
+
+                  <span
+                    style={{
+                      fontSize: '0.68rem',
+                      padding: '2px 6px',
+                      borderRadius: '9999px',
+                      background: box.status === 'CONFIRMED' ? 'rgba(16, 185, 129, 0.2)' : 'rgba(245, 158, 11, 0.2)',
+                      color: box.status === 'CONFIRMED' ? '#6ee7b7' : '#fde68a',
+                      border: '1px solid rgba(255, 255, 255, 0.1)'
+                    }}
+                  >
+                    {box.status === 'CONFIRMED' ? 'Confirmed' : 'Auto-Match'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Classification & Reason */}

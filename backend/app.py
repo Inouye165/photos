@@ -7,7 +7,7 @@ and live folder scanning progress.
 import os
 import sys
 import threading
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Tuple
 from fastapi import FastAPI, HTTPException, Query, Body, BackgroundTasks, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +29,25 @@ from backend.database import (
     log_trash_purge,
     get_trash_purge_logs,
     get_known_entity_folders,
+    record_dismissed_pairs,
+    get_or_create_entity,
+    list_entities,
+    get_entity_by_id,
+    update_entity,
+    delete_entity,
+    insert_detected_box,
+    get_boxes_for_photo,
+    get_box_by_id,
+    update_box_entity,
+    update_box_dimensions,
+    confirm_box,
+    reject_box,
+    batch_confirm_boxes,
+    get_pending_review_boxes,
+    get_unassigned_boxes,
+    delete_box,
+    get_confirmed_embeddings_for_entities,
+    resolve_duplicate_photo_entity_assignments,
     DB_PATH
 )
 from backend.scanner import ScanManager
@@ -36,6 +55,11 @@ from backend.thumbnails import get_thumbnail_path, generate_thumbnail
 from backend.vector_engine import VectorEngine
 from backend.deduplicator import run_deduplication_pass, cleanup_duplicate_group
 from backend.query_parser import QueryParser
+from backend.face_pet_detector import (
+    FacePetDetector,
+    CROPS_CACHE_DIR,
+    STRICT_HIGH_CONFIDENCE_THRESHOLD
+)
 
 import shutil
 from contextlib import asynccontextmanager
@@ -58,6 +82,10 @@ def ensure_all_embeddings_in_background():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     threading.Thread(target=ensure_all_embeddings_in_background, daemon=True).start()
+    try:
+        resolve_duplicate_photo_entity_assignments()
+    except Exception as e:
+        print(f"Error resolving duplicate entity assignments on startup: {e}")
     yield
 
 app = FastAPI(
@@ -105,7 +133,47 @@ class PurgeSpaceRequest(BaseModel):
     force_purge_count: Optional[int] = None
     target_bytes_to_free: Optional[int] = None
 
-def get_drive_space_info(target_dir: str = r"C:\Users\inouy\photos", min_free_gb: float = 5.0):
+class CreateEntityRequest(BaseModel):
+    name: str
+    entity_type: str = "PERSON"
+
+class UpdateEntityRequest(BaseModel):
+    name: Optional[str] = None
+    entity_type: Optional[str] = None
+    avatar_box_id: Optional[int] = None
+
+class CreateBoxRequest(BaseModel):
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+    box_type: str = "FACE"
+    label: str = "person"
+    entity_name: Optional[str] = None
+    entity_type: Optional[str] = "PERSON"
+
+class UpdateBoxRequest(BaseModel):
+    entity_name: Optional[str] = None
+    entity_type: Optional[str] = "PERSON"
+    status: Optional[str] = None
+    x_min: Optional[float] = None
+    y_min: Optional[float] = None
+    x_max: Optional[float] = None
+    y_max: Optional[float] = None
+
+class AssignBoxRequest(BaseModel):
+    entity_name: str
+    entity_type: Optional[str] = "PERSON"
+    set_as_avatar: Optional[bool] = True
+
+class BatchConfirmRequest(BaseModel):
+    box_ids: List[int]
+
+WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def get_drive_space_info(target_dir: Optional[str] = None, min_free_gb: float = 5.0):
+    if not target_dir:
+        target_dir = WORKSPACE_DIR
     drive_path = target_dir if os.path.exists(target_dir) else os.path.expanduser("~")
     try:
         usage = shutil.disk_usage(drive_path)
@@ -152,7 +220,7 @@ def get_default_path():
     """Returns sensible default paths on the host system."""
     user_home = os.path.expanduser("~")
     pictures_dir = os.path.join(user_home, "Pictures")
-    photos_workspace = r"C:\Users\inouy\photos"
+    photos_workspace = WORKSPACE_DIR
     
     suggested = photos_workspace if os.path.exists(photos_workspace) else (pictures_dir if os.path.exists(pictures_dir) else user_home)
     return {
@@ -164,7 +232,7 @@ def get_default_path():
 @app.get("/api/browse-folders")
 def browse_folders(path: Optional[str] = None):
     """Lists subdirectories within a given path for folder & subfolder browsing."""
-    target_path = path.strip() if path and path.strip() else r"C:\Users\inouy\photos"
+    target_path = path.strip() if path and path.strip() else WORKSPACE_DIR
     if not os.path.exists(target_path) or not os.path.isdir(target_path):
         target_path = os.path.expanduser("~")
         
@@ -240,6 +308,7 @@ def list_photos(
     camera_make: Optional[str] = Query(None, description="Filter by camera make"),
     has_gps: Optional[bool] = Query(None, description="Filter by presence of GPS geotag"),
     year: Optional[str] = Query(None, description="Filter by year (e.g. 2026, 2025)"),
+    entity_id: Optional[int] = Query(None, description="Filter by Person or Pet entity ID"),
     sort_by: str = Query("date_taken", description="Sort field: date_taken, file_name, file_size, indexed_at"),
     sort_order: str = Query("DESC", description="Sort direction: ASC, DESC"),
     limit: int = Query(60, ge=1, le=200),
@@ -250,8 +319,8 @@ def list_photos(
     Returns paginated photos. If `query` is provided, performs natural language semantic vector search
     with CLIP embeddings and returns ranked matches.
     """
-    actual_limit = int(limit) if isinstance(limit, (int, float, str)) and str(limit).isdigit() else 60
-    actual_offset = int(offset) if isinstance(offset, (int, float, str)) and str(offset).isdigit() else 0
+    actual_limit = limit
+    actual_offset = offset
     clean_year = year if isinstance(year, str) and year.strip() else None
     clean_camera = camera_make if isinstance(camera_make, str) and camera_make.strip() else None
     clean_gps = has_gps if isinstance(has_gps, bool) else None
@@ -263,18 +332,53 @@ def list_photos(
         parser = QueryParser(known_folders=known_folders)
         parsed = parser.parse(query.strip())
         
-        target_class = clean_class
-        if not target_class or target_class == "ALL":
-            if parsed.classification != "ALL":
-                target_class = parsed.classification
+        target_class = clean_class if clean_class else parsed.classification
 
-        # 2. Perform Semantic Vector Search with clean visual prompt
+        # 2. Check if there are explicit or parsed metadata constraints
+        has_temporal_constraints = bool(parsed.date_from or parsed.date_to or clean_year)
+        has_metadata_constraints = bool(clean_camera or (clean_gps is not None) or (target_class and target_class != "ALL"))
+
+        allowed_candidate_ids = None
+        date_fallback_applied = False
+
+        if has_temporal_constraints or has_metadata_constraints:
+            matched_photos, _ = get_photos(
+                classification=target_class,
+                date_from=parsed.date_from,
+                date_to=parsed.date_to,
+                year=clean_year,
+                camera_make=clean_camera,
+                has_gps=clean_gps,
+                is_trashed=None if include_trashed else False,
+                limit=100000,
+                offset=0
+            )
+            allowed_candidate_ids = {p["id"] for p in matched_photos}
+
+            # If strict temporal filter yielded 0 results, smoothly fall back to ranking across all dates
+            if not allowed_candidate_ids and has_temporal_constraints:
+                date_fallback_applied = True
+                fallback_photos, _ = get_photos(
+                    classification=target_class,
+                    year=clean_year,
+                    camera_make=clean_camera,
+                    has_gps=clean_gps,
+                    is_trashed=None if include_trashed else False,
+                    limit=100000,
+                    offset=0
+                )
+                allowed_candidate_ids = {p["id"] for p in fallback_photos} if fallback_photos else None
+
+        # 3. Perform Semantic Vector Search with pre-filtered candidate subset
         search_prompt = parsed.visual_prompt or query.strip()
         vector_engine = VectorEngine.get_instance()
         
-        # Pull enough candidates for candidate filtering and re-ranking
         top_k_candidates = max(250, (actual_limit + actual_offset) * 4)
-        search_results = vector_engine.search_text(search_prompt, top_k=top_k_candidates)
+        search_results = vector_engine.search_text(
+            search_prompt,
+            top_k=top_k_candidates,
+            allowed_photo_ids=allowed_candidate_ids
+        )
         
         if not search_results:
             return {
@@ -289,37 +393,15 @@ def list_photos(
         photo_id_to_score = {r["photo_id"]: r["similarity_score"] for r in search_results}
         candidate_ids = [r["photo_id"] for r in search_results]
 
-        # 3. Attempt filtering with strict parsed date bounds if present
-        date_fallback_applied = False
         photos, _ = get_photos(
+            classification="ALL",
             photo_ids=candidate_ids,
-            classification=target_class,
-            date_from=parsed.date_from,
-            date_to=parsed.date_to,
-            year=clean_year,
-            camera_make=clean_camera,
-            has_gps=clean_gps,
             is_trashed=None if include_trashed else False,
-            limit=top_k_candidates,
+            limit=len(candidate_ids),
             offset=0
         )
 
-        # 4. If strict date filter yielded 0 results (e.g. no beach trip last month),
-        # smoothly fall back to ranking candidates across all dates
-        if not photos and (parsed.date_from or parsed.date_to):
-            date_fallback_applied = True
-            photos, _ = get_photos(
-                photo_ids=candidate_ids,
-                classification=target_class,
-                year=clean_year,
-                camera_make=clean_camera,
-                has_gps=clean_gps,
-                is_trashed=None if include_trashed else False,
-                limit=top_k_candidates,
-                offset=0
-            )
-
-        # 5. Hybrid scoring: apply entity/folder keyword boost
+        # 4. Hybrid scoring: apply entity/folder keyword boost
         scored_photos = []
         for p in photos:
             base_score = photo_id_to_score.get(p["id"], 0.15)
@@ -363,6 +445,7 @@ def list_photos(
         camera_make=clean_camera,
         has_gps=clean_gps,
         year=clean_year,
+        entity_id=entity_id,
         sort_by=sort_by,
         sort_order=sort_order,
         is_trashed=None if include_trashed else False,
@@ -792,14 +875,22 @@ def purge_trash_for_space(req: PurgeSpaceRequest = Body(...)):
         fpath = item["file_path"]
         fsize = item.get("file_size", 0)
 
-        # Permanently delete physical file
+        # Remove physical file (prefer OS Recycle Bin for safety, fallback to os.remove)
         if os.path.exists(fpath):
             try:
-                os.remove(fpath)
+                if send2trash is not None:
+                    send2trash.send2trash(fpath)
+                else:
+                    os.remove(fpath)
                 actually_freed_bytes += fsize
                 deleted_names.append(item["file_name"])
             except Exception as e:
-                print(f"Error purging file {fpath}: {e}")
+                try:
+                    os.remove(fpath)
+                    actually_freed_bytes += fsize
+                    deleted_names.append(item["file_name"])
+                except Exception as e2:
+                    print(f"Error purging file {fpath}: {e2}")
         else:
             deleted_names.append(item["file_name"])
 
@@ -901,13 +992,25 @@ def trash_group_duplicates_endpoint(group_id: str):
 
 @app.post("/api/duplicates/group/{group_id}/dismiss")
 def dismiss_duplicate_group(group_id: str):
-    """Marks all items in a duplicate group as unique/dismissed without deleting any files."""
+    """Marks all items in a duplicate group as unique/dismissed and permanently remembers their dismissal."""
     conn = get_connection()
+    # Fetch member photo IDs before dissolving group
+    rows = conn.execute("SELECT id FROM photos WHERE duplicate_group_id = ?", (group_id,)).fetchall()
+    member_ids = [r["id"] for r in rows]
+
+    # Record all pairwise combinations as dismissed
+    if len(member_ids) > 1:
+        pairs = []
+        for i in range(len(member_ids)):
+            for j in range(i + 1, len(member_ids)):
+                pairs.append((member_ids[i], member_ids[j]))
+        record_dismissed_pairs(pairs)
+
     conn.execute("UPDATE photos SET duplicate_group_id = NULL, is_primary = 1, duplicate_count = 0 WHERE duplicate_group_id = ?", (group_id,))
     conn.execute("DELETE FROM duplicate_groups WHERE id = ?", (group_id,))
     conn.commit()
     conn.close()
-    return {"message": f"Duplicate group '{group_id}' dismissed. All files kept intact."}
+    return {"message": f"Duplicate group '{group_id}' dismissed. All files kept intact and pairs will not be re-clustered."}
 
 @app.get("/api/filtered")
 def get_filtered_assets(limit: int = 100, offset: int = 0):
@@ -952,7 +1055,408 @@ def reclassify_photo(photo_id: int, req: ReclassifyRequest):
 @app.get("/api/stats")
 def get_library_stats():
     """Returns overall library statistics."""
-    return get_stats()
+    stats = get_stats()
+    # Augment with people & pets summary
+    try:
+        conn = get_connection()
+        p_count = conn.execute("SELECT COUNT(*) FROM entities WHERE entity_type = 'PERSON'").fetchone()[0]
+        pet_count = conn.execute("SELECT COUNT(*) FROM entities WHERE entity_type = 'PET'").fetchone()[0]
+        pending_count = conn.execute("SELECT COUNT(*) FROM detected_boxes WHERE status = 'PENDING_REVIEW'").fetchone()[0]
+        conn.close()
+        stats["total_people"] = p_count
+        stats["total_pets"] = pet_count
+        stats["total_pending_boxes"] = pending_count
+    except Exception:
+        stats["total_people"] = 0
+        stats["total_pets"] = 0
+        stats["total_pending_boxes"] = 0
+    return stats
+
+# ---------------------------------------------------------
+# People & Pets Background Scanner Manager
+# ---------------------------------------------------------
+
+class PeoplePetsScanManager:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self.is_scanning = False
+        self.total = 0
+        self.processed = 0
+        self.matches_found = 0
+        self.stopped = False
+
+    @classmethod
+    def get_instance(cls) -> "PeoplePetsScanManager":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = PeoplePetsScanManager()
+            return cls._instance
+
+    def start_scan(self) -> bool:
+        with self._lock:
+            if self.is_scanning:
+                return False
+            self.is_scanning = True
+            self.stopped = False
+            self.processed = 0
+            self.matches_found = 0
+            threading.Thread(target=self._run, daemon=True).start()
+            return True
+
+    def stop_scan(self):
+        self.stopped = True
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "is_scanning": self.is_scanning,
+            "total": self.total,
+            "processed": self.processed,
+            "matches_found": self.matches_found,
+            "progress_percent": round((self.processed / max(1, self.total)) * 100, 1) if self.total > 0 else 0.0
+        }
+
+    def _run(self):
+        try:
+            conn = get_connection()
+            rows = conn.execute("""
+                SELECT p.id, p.file_path FROM photos p
+                LEFT JOIN detected_boxes b ON p.id = b.photo_id
+                WHERE b.id IS NULL AND p.is_trashed = 0 AND p.classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO')
+                ORDER BY p.id DESC
+            """).fetchall()
+            conn.close()
+
+            self.total = len(rows)
+            detector = FacePetDetector.get_instance()
+            entity_embeddings = get_confirmed_embeddings_for_entities()
+
+            for r in rows:
+                if self.stopped:
+                    break
+                pid, fpath = r["id"], r["file_path"]
+                if os.path.exists(fpath):
+                    boxes = detector.process_photo(pid, fpath, entity_embeddings=entity_embeddings)
+                    pending_in_photo = sum(1 for b in boxes if b.get("status") == "PENDING_REVIEW")
+                    self.matches_found += pending_in_photo
+                self.processed += 1
+        except Exception as e:
+            print(f"People & pets scan error: {e}")
+        finally:
+            self.is_scanning = False
+
+# ---------------------------------------------------------
+# People & Pets REST Endpoints
+# ---------------------------------------------------------
+
+@app.get("/api/people-pets/entities")
+def get_entities(entity_type: Optional[str] = Query(None, description="Filter by PERSON or PET")):
+    """Lists all registered people and pets with photo and review counts."""
+    return list_entities(entity_type=entity_type)
+
+@app.post("/api/people-pets/entities")
+def create_entity(req: CreateEntityRequest):
+    """Creates a new person or pet entity."""
+    return get_or_create_entity(req.name, req.entity_type)
+
+@app.put("/api/people-pets/entities/{entity_id}")
+def update_entity_endpoint(entity_id: int, req: UpdateEntityRequest):
+    """Updates entity metadata."""
+    success = update_entity(entity_id, req.name, req.entity_type, req.avatar_box_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    return {"message": "Entity updated successfully"}
+
+@app.delete("/api/people-pets/entities/{entity_id}")
+def delete_entity_endpoint(entity_id: int):
+    """Deletes an entity and clears associations."""
+    success = delete_entity(entity_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    return {"message": "Entity deleted successfully"}
+
+@app.get("/api/people-pets/pending")
+def get_pending_reviews(
+    limit: int = Query(60, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    entity_id: Optional[int] = Query(None, description="Filter by specific entity")
+):
+    """Retrieves all strong match suggestions waiting for user confirmation."""
+    items, total = get_pending_review_boxes(limit=limit, offset=offset, entity_id=entity_id)
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    }
+
+@app.post("/api/people-pets/boxes/{box_id}/confirm")
+def confirm_box_endpoint(box_id: int, entity_id: Optional[int] = Query(None)):
+    """Confirms an auto-tagged box suggestion."""
+    box = get_box_by_id(box_id)
+    if not box:
+        raise HTTPException(status_code=404, detail="Detected box not found")
+
+    target_eid = entity_id if entity_id is not None else box.get("entity_id")
+    if target_eid is None:
+        raise HTTPException(status_code=400, detail="Cannot confirm box without an associated entity")
+
+    confirm_box(box_id, entity_id=target_eid)
+
+    # Set avatar if entity does not have one yet
+    entity = get_entity_by_id(target_eid)
+    if entity and not entity.get("avatar_box_id"):
+        update_entity(target_eid, avatar_box_id=box_id)
+
+    return {"message": "Box confirmed successfully", "box_id": box_id, "entity_id": target_eid}
+
+@app.post("/api/people-pets/boxes/{box_id}/reject")
+def reject_box_endpoint(box_id: int):
+    """Rejects an auto-tagged box suggestion."""
+    box = get_box_by_id(box_id)
+    if not box:
+        raise HTTPException(status_code=404, detail="Detected box not found")
+    reject_box(box_id)
+    return {"message": "Suggestion rejected", "box_id": box_id}
+
+@app.post("/api/people-pets/boxes/batch-confirm")
+def batch_confirm_endpoint(req: BatchConfirmRequest):
+    """Confirms multiple suggestions at once."""
+    count = batch_confirm_boxes(req.box_ids)
+    return {"message": f"Confirmed {count} suggestions", "count": count}
+
+@app.post("/api/people-pets/resolve-duplicates")
+def resolve_duplicate_entities_endpoint():
+    """Enforces single-identity constraint per photo across the entire library."""
+    count = resolve_duplicate_photo_entity_assignments()
+    return {"message": f"Resolved {count} duplicate entity assignments", "resolved_count": count}
+
+@app.get("/api/people-pets/unassigned")
+def get_unassigned_detected_boxes(
+    limit: int = Query(60, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    box_type: Optional[str] = Query(None, description="Filter by FACE, PERSON, PET, or ALL")
+):
+    """Returns all detected faces and pets across the library that have not yet been named."""
+    items, total = get_unassigned_boxes(limit=limit, offset=offset, box_type=box_type)
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    }
+
+@app.post("/api/people-pets/boxes/{box_id}/assign")
+def assign_box_to_entity(box_id: int, req: AssignBoxRequest):
+    """Assigns a detected face or pet crop to a named entity (e.g. Ron), sets as confirmed and avatar."""
+    box = get_box_by_id(box_id)
+    if not box:
+        raise HTTPException(status_code=404, detail="Detected box not found")
+    
+    entity = get_or_create_entity(req.entity_name.strip(), req.entity_type or "PERSON")
+    entity_id = entity["id"]
+
+    update_box_entity(box_id, entity_id, status="CONFIRMED", match_confidence=1.0)
+
+    # Set as avatar if requested or if entity has no avatar yet
+    if req.set_as_avatar or not entity.get("avatar_box_id"):
+        update_entity(entity_id, avatar_box_id=box_id)
+
+    return {
+        "message": f"Successfully tagged as {req.entity_name}",
+        "box_id": box_id,
+        "entity_id": entity_id,
+        "entity_name": req.entity_name
+    }
+
+@app.post("/api/people-pets/entities/{entity_id}/set-avatar")
+def set_entity_avatar(entity_id: int, box_id: Optional[int] = Query(None)):
+    """Sets or clears the profile picture for an entity."""
+    entity = get_entity_by_id(entity_id)
+    if not entity:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    update_entity(entity_id, avatar_box_id=box_id)
+    return {"message": "Avatar updated successfully", "entity_id": entity_id, "avatar_box_id": box_id}
+
+@app.post("/api/people-pets/boxes/{box_id}/unlink")
+def unlink_box(box_id: int):
+    """Unlinks a box from its person/pet without deleting the detection."""
+    box = get_box_by_id(box_id)
+    if not box:
+        raise HTTPException(status_code=404, detail="Box not found")
+    if box.get("entity_id"):
+        entity = get_entity_by_id(box["entity_id"])
+        if entity and entity.get("avatar_box_id") == box_id:
+            update_entity(box["entity_id"], avatar_box_id=None)
+    update_box_entity(box_id, None, status="UNASSIGNED", match_confidence=0.0)
+    return {"message": "Box unlinked successfully", "box_id": box_id}
+
+@app.get("/api/photos/{photo_id}/boxes")
+def get_photo_boxes(photo_id: int):
+    """
+    Returns all detected bounding boxes for a photo.
+    Lazily runs high-precision detection on the fly if not yet scanned.
+    """
+    photo = get_photo_by_id(photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+
+    detector = FacePetDetector.get_instance()
+    boxes = detector.process_photo(photo_id, photo["file_path"])
+    # Enrich with entity names
+    enriched = get_boxes_for_photo(photo_id)
+    return {"boxes": enriched if enriched else boxes}
+
+@app.post("/api/photos/{photo_id}/boxes")
+def create_manual_box(photo_id: int, req: CreateBoxRequest):
+    """Allows user to manually draw a bounding box and assign a person or pet."""
+    photo = get_photo_by_id(photo_id)
+    if not photo or not os.path.exists(photo["file_path"]):
+        raise HTTPException(status_code=404, detail="Photo file not found")
+
+    detector = FacePetDetector.get_instance()
+    entity_id = None
+    if req.entity_name and req.entity_name.strip():
+        entity = get_or_create_entity(req.entity_name.strip(), req.entity_type or "PERSON")
+        entity_id = entity["id"]
+
+    box_record = {
+        "photo_id": photo_id,
+        "entity_id": entity_id,
+        "box_type": req.box_type,
+        "label": req.label,
+        "confidence": 1.0,
+        "x_min": max(0.0, min(1.0, req.x_min)),
+        "y_min": max(0.0, min(1.0, req.y_min)),
+        "x_max": max(0.0, min(1.0, req.x_max)),
+        "y_max": max(0.0, min(1.0, req.y_max)),
+        "status": "CONFIRMED" if entity_id else "UNASSIGNED",
+        "match_confidence": 1.0 if entity_id else 0.0
+    }
+
+    try:
+        with Image.open(photo["file_path"]) as img:
+            img_transposed = ImageOps.exif_transpose(img)
+            emb, crop_pil = detector.extract_crop_embedding(img_transposed, box_record)
+            box_record["embedding_json"] = json.dumps(emb)
+    except Exception as e:
+        print(f"Error computing crop embedding: {e}")
+        crop_pil = None
+
+    box_id = insert_detected_box(box_record)
+    box_record["id"] = box_id
+
+    if crop_pil is not None:
+        crop_path = os.path.join(CROPS_CACHE_DIR, f"{box_id}.jpg")
+        crop_pil.thumbnail((320, 320), Image.Resampling.LANCZOS)
+        crop_pil.save(crop_path, "JPEG", quality=90)
+
+    if entity_id:
+        entity = get_entity_by_id(entity_id)
+        if entity and not entity.get("avatar_box_id"):
+            update_entity(entity_id, avatar_box_id=box_id)
+
+    return {"message": "Bounding box created", "box": box_record}
+
+@app.put("/api/photos/{photo_id}/boxes/{box_id}")
+def update_photo_box(photo_id: int, box_id: int, req: UpdateBoxRequest):
+    """Updates the name / person assigned to a bounding box, or updates dimensions."""
+    box = get_box_by_id(box_id)
+    if not box:
+        raise HTTPException(status_code=404, detail="Box not found")
+
+    # Update dimensions if provided
+    dimensions_changed = False
+    if req.x_min is not None and req.y_min is not None and req.x_max is not None and req.y_max is not None:
+        update_box_dimensions(box_id, req.x_min, req.y_min, req.x_max, req.y_max)
+        dimensions_changed = True
+
+    entity_id = box.get("entity_id")
+    if req.entity_name is not None:
+        if req.entity_name.strip():
+            entity = get_or_create_entity(req.entity_name.strip(), req.entity_type or "PERSON")
+            entity_id = entity["id"]
+        else:
+            entity_id = None
+
+    status = req.status or (box["status"] if entity_id else "UNASSIGNED")
+    if req.entity_name is not None or req.status is not None:
+        update_box_entity(box_id, entity_id, status=status, match_confidence=1.0)
+
+    if entity_id:
+        entity = get_entity_by_id(entity_id)
+        if entity and not entity.get("avatar_box_id"):
+            update_entity(entity_id, avatar_box_id=box_id)
+
+    # Re-extract crop and embedding if dimensions changed or newly assigned
+    if dimensions_changed:
+        try:
+            photo = get_photo_by_id(photo_id)
+            if photo and os.path.exists(photo["file_path"]):
+                detector = FacePetDetector.get_instance()
+                with Image.open(photo["file_path"]) as img:
+                    img_t = ImageOps.exif_transpose(img)
+                    updated_box = dict(box)
+                    updated_box.update({"x_min": req.x_min, "y_min": req.y_min, "x_max": req.x_max, "y_max": req.y_max})
+                    emb, crop_pil = detector.extract_crop_embedding(img_t, updated_box)
+                    if crop_pil:
+                        crop_path = os.path.join(CROPS_CACHE_DIR, f"{box_id}.jpg")
+                        crop_pil.thumbnail((320, 320), Image.Resampling.LANCZOS)
+                        crop_pil.save(crop_path, "JPEG", quality=90)
+                    conn = get_connection()
+                    with conn:
+                        conn.execute("UPDATE detected_boxes SET embedding_json = ? WHERE id = ?", (json.dumps(emb), box_id))
+                    conn.close()
+        except Exception as e:
+            print(f"Error re-extracting resized box crop: {e}")
+
+    return {"message": "Box updated successfully", "box_id": box_id, "entity_id": entity_id}
+
+@app.delete("/api/photos/{photo_id}/boxes/{box_id}")
+def delete_photo_box(photo_id: int, box_id: int):
+    """Deletes a bounding box."""
+    delete_box(box_id)
+    crop_path = os.path.join(CROPS_CACHE_DIR, f"{box_id}.jpg")
+    if os.path.exists(crop_path):
+        try:
+            os.remove(crop_path)
+        except Exception:
+            pass
+    return {"message": "Box deleted successfully"}
+
+@app.get("/api/boxes/{box_id}/crop")
+def get_box_crop(box_id: int):
+    """Serves high-quality cropped thumbnail for an avatar or confirmation card."""
+    crop_path = os.path.join(CROPS_CACHE_DIR, f"{box_id}.jpg")
+    if os.path.exists(crop_path):
+        return FileResponse(crop_path, media_type="image/jpeg", headers=IMMUTABLE_CACHE_HEADERS)
+
+    box = get_box_by_id(box_id)
+    if not box:
+        raise HTTPException(status_code=404, detail="Box not found")
+
+    detector = FacePetDetector.get_instance()
+    generated_path = detector.get_or_generate_crop(box)
+    if generated_path and os.path.exists(generated_path):
+        return FileResponse(generated_path, media_type="image/jpeg", headers=IMMUTABLE_CACHE_HEADERS)
+
+    raise HTTPException(status_code=404, detail="Crop could not be generated")
+
+@app.post("/api/people-pets/scan")
+def trigger_people_pets_scan():
+    """Starts background detection and high-confidence auto-matching across the library."""
+    manager = PeoplePetsScanManager.get_instance()
+    started = manager.start_scan()
+    if not started:
+        return {"message": "Scan already running", "is_scanning": True}
+    return {"message": "Background People & Pets scan started", "is_scanning": True}
+
+@app.get("/api/people-pets/scan/status")
+def get_people_pets_scan_status():
+    """Returns background People & Pets scan status and counters."""
+    manager = PeoplePetsScanManager.get_instance()
+    return manager.get_status()
 
 # Mount frontend with full SPA fallback
 FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")

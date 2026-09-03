@@ -6,21 +6,23 @@ import Lightbox from './components/Lightbox';
 import DuplicatesView from './components/DuplicatesView';
 import FilteredView from './components/FilteredView';
 import TrashView from './components/TrashView';
+import PeoplePetsView from './components/PeoplePetsView';
 import ScanModal from './components/ScanModal';
 import MobileConnectModal from './components/MobileConnectModal';
 import TimelineScrubber from './components/TimelineScrubber';
 import TrashSelectionBar from './components/TrashSelectionBar';
 import ConfirmTrashModal from './components/ConfirmTrashModal';
 import { fetchPhotos, fetchStats, tagPhotoTrash, batchTagTrash } from './api';
-import { Filter, SlidersHorizontal, MapPin, Eye, EyeOff, Sparkles, Copy, ShieldAlert, Smartphone, Calendar, Trash2, CheckSquare, CheckCircle2 } from 'lucide-react';
+import { Filter, SlidersHorizontal, MapPin, Eye, EyeOff, Sparkles, Copy, ShieldAlert, Smartphone, Calendar, Trash2, CheckSquare, CheckCircle2, User, X } from 'lucide-react';
 
 const PAGE_SIZE = 80;
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('photos'); // 'photos', 'duplicates', 'filtered', 'trash'
+  const [activeTab, setActiveTab] = useState('photos'); // 'photos', 'people-pets', 'duplicates', 'filtered', 'trash'
   const [photos, setPhotos] = useState([]);
   const [totalPhotos, setTotalPhotos] = useState(0);
   const [stats, setStats] = useState(null);
+  const [selectedEntity, setSelectedEntity] = useState(null);
   
   // Search & Filter state
   const [query, setQuery] = useState('');
@@ -115,6 +117,7 @@ export default function App() {
       fetchPhotos({
         query: searchQuery,
         year: yearFilter,
+        entityId: options.entityId !== undefined ? options.entityId : selectedEntity?.id || null,
         includeDuplicates,
         cameraMake: cameraMake || null,
         hasGps: hasGps,
@@ -142,6 +145,7 @@ export default function App() {
       fetchPhotos({
         query: searchQuery,
         year: yearFilter,
+        entityId: options.entityId !== undefined ? options.entityId : selectedEntity?.id || null,
         includeDuplicates,
         cameraMake: cameraMake || null,
         hasGps: hasGps,
@@ -165,7 +169,7 @@ export default function App() {
           setIsLoading(false);
         });
     }
-  }, [debouncedQuery, selectedYear, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder, photos.length, totalPhotos]);
+  }, [debouncedQuery, selectedYear, selectedEntity, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder, photos.length, totalPhotos]);
 
   // Initial load or filter changes
   useEffect(() => {
@@ -174,7 +178,7 @@ export default function App() {
 
   useEffect(() => {
     loadPhotos({ isLoadMore: false });
-  }, [debouncedQuery, selectedYear, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder]);
+  }, [debouncedQuery, selectedYear, selectedEntity, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder]);
 
   const handleSearch = (searchQuery) => {
     setQuery(searchQuery);
@@ -434,6 +438,44 @@ export default function App() {
               </div>
             </div>
 
+            {/* Active Person/Pet Filter Chip */}
+            {selectedEntity && (
+              <div
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  background: 'rgba(99, 102, 241, 0.15)',
+                  border: '1px solid rgba(99, 102, 241, 0.4)',
+                  padding: '6px 14px',
+                  borderRadius: '9999px',
+                  margin: '0.5rem 1.5rem 0.5rem',
+                  fontSize: '0.85rem',
+                  color: '#c7d2fe'
+                }}
+              >
+                <User size={15} color="#818cf8" />
+                <span>
+                  Filtering by {selectedEntity.entity_type === 'PET' ? 'Pet' : 'Person'}: <strong>{selectedEntity.name}</strong> ({totalPhotos} photos)
+                </span>
+                <button
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    color: '#94a3b8',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    padding: '2px'
+                  }}
+                  onClick={() => setSelectedEntity(null)}
+                  title="Clear person filter"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            )}
+
             {/* Photo Grid */}
             <PhotoGrid
               photos={photos}
@@ -451,6 +493,16 @@ export default function App() {
               onLoadMore={handleLoadMore}
             />
           </>
+        )}
+
+        {activeTab === 'people-pets' && (
+          <PeoplePetsView
+            onSelectEntity={(entity) => {
+              setSelectedEntity(entity);
+              setActiveTab('photos');
+            }}
+            onOpenLightboxPhoto={(photo) => setSelectedPhoto(photo)}
+          />
         )}
 
         {activeTab === 'duplicates' && (
@@ -483,6 +535,14 @@ export default function App() {
         >
           <Sparkles size={20} />
           <span>Photos</span>
+        </button>
+
+        <button
+          className={`mobile-nav-item ${activeTab === 'people-pets' ? 'active' : ''}`}
+          onClick={() => setActiveTab('people-pets')}
+        >
+          <User size={20} />
+          <span>People</span>
         </button>
 
         <button

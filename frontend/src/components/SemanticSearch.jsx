@@ -105,7 +105,13 @@ export default function SemanticSearch({ query, setQuery, onSearch, isLoading, p
           {parsedQuery.classification && (
             <span className="facet-pill facet-pill-filter" title="Classification target">
               <ShieldCheck size={12} />
-              <span>{parsedQuery.classification === 'SCREENSHOT' ? 'Screenshots' : 'Real Photos Only'}</span>
+              <span>
+                {parsedQuery.classification === 'SCREENSHOT'
+                  ? 'Screenshots'
+                  : parsedQuery.classification === 'ALL'
+                  ? 'All Media'
+                  : 'Real Photos Only'}
+              </span>
             </span>
           )}
         </div>

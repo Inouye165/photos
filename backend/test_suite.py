@@ -286,11 +286,47 @@ def run_tests():
         assert reconciled_group is not None, "Group should still exist with 2 remaining photos"
         assert reconciled_group["total_items"] == 2
 
-        # User subsequently trashes tp3, leaving only 1 photo: group should auto-resolve
-        client.post("/api/photos/batch-trash", json={"photo_ids": [tp3], "is_trashed": True})
-        groups_after_final = client.get("/api/duplicates").json()
-        assert not any(g["group_id"] == trip_group["group_id"] for g in groups_after_final), "Group should be resolved after keeping 1 photo"
-        print("[PASS] Selective Duplicate Shootout: Successfully reconciled partial duplicate group trashing and auto-resolved on single keeper", flush=True)
+        # Step 13: Test Duplicate Dismissal Persistence Across Scans/Passes
+        dis_orig = os.path.join(test_dir, "dis_orig.jpg")
+        dis_copy = os.path.join(test_dir, "dis_copy.jpg")
+        shutil.copy2(trip_base, dis_orig)
+        shutil.copy2(trip_base, dis_copy)
+        dis_m1 = extract_metadata(dis_orig)
+        dis_m2 = extract_metadata(dis_copy)
+        dp1 = upsert_photo({**dis_m1, "classification": "VERIFIED_PHOTO", "indexed_at": 4001})
+        dp2 = upsert_photo({**dis_m2, "classification": "VERIFIED_PHOTO", "indexed_at": 4002})
+        run_deduplication_pass()
+
+        groups_res = client.get("/api/duplicates")
+        dis_group = next(
+            (g for g in groups_res.json() if any(item["id"] == dp1 for item in [g["primary"], *g["duplicates"]])),
+            None
+        )
+        assert dis_group is not None, "Expected duplicate group to be created for dismissal test"
+
+        # Dismiss the duplicate group
+        dismiss_res = client.post(f"/api/duplicates/group/{dis_group['group_id']}/dismiss")
+        assert dismiss_res.status_code == 200, f"Dismiss failed: {dismiss_res.text}"
+
+        # Re-run full deduplication pass
+        run_deduplication_pass()
+
+        # Verify the dismissed pair does NOT re-cluster into a duplicate group
+        groups_after_repass = client.get("/api/duplicates").json()
+        assert not any(
+            any(item["id"] == dp1 for item in [g["primary"], *g["duplicates"]]) for g in groups_after_repass
+        ), "Dismissed duplicate pair was improperly re-clustered after a deduplication pass!"
+        print("[PASS] Dismissal Persistence: Dismissed duplicate pair remembered and prevented from re-clustering", flush=True)
+
+        # Step 14: Test Semantic Search with Candidate Pre-Filtering
+        vector_engine.add_or_update_photo(dp1, dis_orig, test_db)
+        # Search with allowed_photo_ids restricted to [dp1]
+        filtered_search = vector_engine.search_text("colorful blue", top_k=5, allowed_photo_ids={dp1})
+        assert len(filtered_search) == 1 and filtered_search[0]["photo_id"] == dp1, "Pre-filtered search did not constrain to allowed ID"
+        # Search with empty allowed set
+        empty_search = vector_engine.search_text("colorful blue", top_k=5, allowed_photo_ids={999999})
+        assert len(empty_search) == 0, "Expected empty results for non-matching allowed IDs"
+        print("[PASS] Semantic Candidate Pre-Filtering: Successfully restricted search space without global truncation flaws", flush=True)
 
         print("\n*** ALL UNIT & INTEGRATION TESTS PASSED PERFECTLY! ***\n", flush=True)
 

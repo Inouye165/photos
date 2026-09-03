@@ -45,7 +45,7 @@ if __name__ == "__main__":
     for nurl in network_urls:
         print(f"   * Phone / Wi-Fi LAN: {nurl}")
     print("=" * 65)
-    print("   Note: Original photos stay 100% untouched in their original folders.")
+    print("   Note: In-place pointer catalog. Deletions safely protect to OS Recycle Bin.")
     print("=" * 65)
 
     # Open local browser

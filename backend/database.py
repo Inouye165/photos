@@ -120,6 +120,42 @@ def init_db(db_path: Optional[str] = None):
             deleted_files_json TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS dismissed_duplicates (
+            photo_id_a INTEGER NOT NULL,
+            photo_id_b INTEGER NOT NULL,
+            dismissed_at REAL NOT NULL,
+            PRIMARY KEY (photo_id_a, photo_id_b)
+        );
+
+        CREATE TABLE IF NOT EXISTS entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            entity_type TEXT NOT NULL DEFAULT 'PERSON', -- 'PERSON', 'PET', 'OTHER'
+            avatar_box_id INTEGER,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS detected_boxes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_id INTEGER NOT NULL,
+            entity_id INTEGER,
+            box_type TEXT NOT NULL DEFAULT 'FACE', -- 'FACE', 'PERSON', 'PET'
+            label TEXT, -- 'person', 'dog', 'cat', etc.
+            confidence REAL DEFAULT 1.0,
+            x_min REAL NOT NULL,
+            y_min REAL NOT NULL,
+            x_max REAL NOT NULL,
+            y_max REAL NOT NULL,
+            embedding_json TEXT,
+            status TEXT NOT NULL DEFAULT 'UNASSIGNED', -- 'UNASSIGNED', 'PENDING_REVIEW', 'CONFIRMED', 'REJECTED'
+            match_confidence REAL DEFAULT 0.0,
+            created_at REAL NOT NULL,
+            reviewed_at REAL,
+            FOREIGN KEY (photo_id) REFERENCES photos (id) ON DELETE CASCADE,
+            FOREIGN KEY (entity_id) REFERENCES entities (id) ON DELETE SET NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_photos_classification ON photos(classification);
         CREATE INDEX IF NOT EXISTS idx_photos_sha256 ON photos(sha256);
         CREATE INDEX IF NOT EXISTS idx_photos_phash ON photos(phash);
@@ -131,6 +167,11 @@ def init_db(db_path: Optional[str] = None):
         CREATE INDEX IF NOT EXISTS idx_photos_trashed_class ON photos(is_trashed, classification);
         CREATE INDEX IF NOT EXISTS idx_photos_effective_date ON photos(is_trashed, classification, COALESCE(date_taken, datetime(file_modified_at, 'unixepoch')) DESC);
         CREATE INDEX IF NOT EXISTS idx_photos_dup_primary ON photos(duplicate_group_id, is_primary, is_trashed);
+        CREATE INDEX IF NOT EXISTS idx_dismissed_dups ON dismissed_duplicates(photo_id_a, photo_id_b);
+        CREATE INDEX IF NOT EXISTS idx_boxes_photo_id ON detected_boxes(photo_id);
+        CREATE INDEX IF NOT EXISTS idx_boxes_entity_id ON detected_boxes(entity_id);
+        CREATE INDEX IF NOT EXISTS idx_boxes_status ON detected_boxes(status);
+        CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
         """)
 
         # Migration: Ensure is_trashed and trashed_at columns exist on existing DBs
@@ -140,10 +181,38 @@ def init_db(db_path: Optional[str] = None):
         if "trashed_at" not in columns:
             conn.execute("ALTER TABLE photos ADD COLUMN trashed_at REAL")
         
+        conn.execute("CREATE TABLE IF NOT EXISTS dismissed_duplicates (photo_id_a INTEGER NOT NULL, photo_id_b INTEGER NOT NULL, dismissed_at REAL NOT NULL, PRIMARY KEY (photo_id_a, photo_id_b))")
+        conn.execute("CREATE TABLE IF NOT EXISTS entities (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, entity_type TEXT NOT NULL DEFAULT 'PERSON', avatar_box_id INTEGER, created_at REAL NOT NULL, updated_at REAL NOT NULL)")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS detected_boxes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_id INTEGER NOT NULL,
+            entity_id INTEGER,
+            box_type TEXT NOT NULL DEFAULT 'FACE',
+            label TEXT,
+            confidence REAL DEFAULT 1.0,
+            x_min REAL NOT NULL,
+            y_min REAL NOT NULL,
+            x_max REAL NOT NULL,
+            y_max REAL NOT NULL,
+            embedding_json TEXT,
+            status TEXT NOT NULL DEFAULT 'UNASSIGNED',
+            match_confidence REAL DEFAULT 0.0,
+            created_at REAL NOT NULL,
+            reviewed_at REAL,
+            FOREIGN KEY (photo_id) REFERENCES photos (id) ON DELETE CASCADE,
+            FOREIGN KEY (entity_id) REFERENCES entities (id) ON DELETE SET NULL
+        )
+        """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_is_trashed ON photos(is_trashed)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_trashed_class ON photos(is_trashed, classification)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_effective_date ON photos(is_trashed, classification, COALESCE(date_taken, datetime(file_modified_at, 'unixepoch')) DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_dup_primary ON photos(duplicate_group_id, is_primary, is_trashed)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dismissed_dups ON dismissed_duplicates(photo_id_a, photo_id_b)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_boxes_photo_id ON detected_boxes(photo_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_boxes_entity_id ON detected_boxes(entity_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_boxes_status ON detected_boxes(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)")
     conn.close()
 
 def upsert_photo(photo_data: Dict[str, Any], db_path: Optional[str] = None) -> int:
@@ -365,6 +434,7 @@ def get_photos(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     folder_keyword: Optional[str] = None,
+    entity_id: Optional[int] = None,
     sort_by: str = "date_taken",
     sort_order: str = "DESC",
     is_trashed: Optional[bool] = False,
@@ -379,6 +449,10 @@ def get_photos(
     conn = get_connection(db_path)
     conditions = []
     params = []
+
+    if entity_id is not None:
+        conditions.append("id IN (SELECT photo_id FROM detected_boxes WHERE entity_id = ? AND status IN ('CONFIRMED', 'PENDING_REVIEW'))")
+        params.append(entity_id)
 
     if photo_ids is not None:
         clean_ids = list(photo_ids)
@@ -396,8 +470,9 @@ def get_photos(
     if classification == "ALL":
         pass  # Don't filter by classification
     elif classification == "REAL_PHOTOS" or classification is None:
-        # Default to showing genuine camera photos unless specified
-        conditions.append("classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO')")
+        # Default to showing genuine camera photos unless photo_ids is explicitly provided
+        if photo_ids is None:
+            conditions.append("classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO')")
     elif classification:
         conditions.append("classification = ?")
         params.append(classification)
@@ -564,3 +639,433 @@ def get_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
         "top_cameras": [dict(c) for c in cameras],
         "timeline_years": [dict(y) for y in years]
     }
+
+def record_dismissed_pairs(pairs: List[Tuple[int, int]], db_path: Optional[str] = None):
+    """Records pairwise photo IDs that the user has dismissed so they are never grouped again."""
+    if not pairs:
+        return
+    import time
+    now = time.time()
+    conn = get_connection(db_path)
+    with conn:
+        for a, b in pairs:
+            p1, p2 = (a, b) if a < b else (b, a)
+            conn.execute(
+                "INSERT OR IGNORE INTO dismissed_duplicates (photo_id_a, photo_id_b, dismissed_at) VALUES (?, ?, ?)",
+                (p1, p2, now)
+            )
+    conn.close()
+
+def get_dismissed_pairs_set(db_path: Optional[str] = None) -> set:
+    """Returns a set of (min_id, max_id) tuples of user-dismissed duplicate pairs."""
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute("SELECT photo_id_a, photo_id_b FROM dismissed_duplicates")
+        return {(r[0], r[1]) for r in cursor.fetchall()}
+    except Exception:
+        return set()
+    finally:
+        conn.close()
+
+# ---------------------------------------------------------
+# People & Pets Entity and Bounding Box Operations
+# ---------------------------------------------------------
+
+def get_or_create_entity(name: str, entity_type: str = "PERSON", db_path: Optional[str] = None) -> Dict[str, Any]:
+    """Gets an existing entity by name (case-insensitive) or creates a new one."""
+    import time
+    name_clean = name.strip()
+    if not name_clean:
+        raise ValueError("Entity name cannot be empty")
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.execute("SELECT * FROM entities WHERE LOWER(name) = LOWER(?)", (name_clean,))
+        row = cursor.fetchone()
+        if row:
+            return dict(row)
+        
+        now = time.time()
+        with conn:
+            cursor = conn.execute(
+                "INSERT INTO entities (name, entity_type, created_at, updated_at) VALUES (?, ?, ?, ?) RETURNING id",
+                (name_clean, entity_type.upper(), now, now)
+            )
+            new_id = cursor.fetchone()[0]
+            cursor = conn.execute("SELECT * FROM entities WHERE id = ?", (new_id,))
+            return dict(cursor.fetchone())
+    finally:
+        conn.close()
+
+def list_entities(entity_type: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Lists all entities with total photos count, confirmed count, pending review count, and avatar."""
+    conn = get_connection(db_path)
+    filter_sql = ""
+    params: List[Any] = []
+    if entity_type:
+        filter_sql = "WHERE e.entity_type = ?"
+        params.append(entity_type.upper())
+    
+    sql = f"""
+    SELECT 
+        e.*,
+        COUNT(DISTINCT CASE WHEN b.status IN ('CONFIRMED', 'PENDING_REVIEW') THEN b.photo_id END) as total_photos,
+        COUNT(CASE WHEN b.status = 'CONFIRMED' THEN 1 END) as confirmed_count,
+        COUNT(CASE WHEN b.status = 'PENDING_REVIEW' THEN 1 END) as pending_count,
+        (
+            SELECT b2.id FROM detected_boxes b2 
+            WHERE b2.entity_id = e.id AND b2.status = 'CONFIRMED' 
+            ORDER BY b2.confidence DESC, b2.id ASC LIMIT 1
+        ) as representative_box_id
+    FROM entities e
+    LEFT JOIN detected_boxes b ON b.entity_id = e.id
+    {filter_sql}
+    GROUP BY e.id
+    ORDER BY confirmed_count DESC, e.name ASC
+    """
+    cursor = conn.execute(sql, params)
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_entity_by_id(entity_id: int, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieves single entity by ID."""
+    conn = get_connection(db_path)
+    cursor = conn.execute("SELECT * FROM entities WHERE id = ?", (entity_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def update_entity(entity_id: int, name: Optional[str] = None, entity_type: Optional[str] = None, avatar_box_id: Optional[int] = None, db_path: Optional[str] = None) -> bool:
+    """Updates entity metadata."""
+    import time
+    conn = get_connection(db_path)
+    updates = ["updated_at = ?"]
+    params: List[Any] = [time.time()]
+    if name is not None:
+        updates.append("name = ?")
+        params.append(name.strip())
+    if entity_type is not None:
+        updates.append("entity_type = ?")
+        params.append(entity_type.upper())
+    if avatar_box_id is not None:
+        updates.append("avatar_box_id = ?")
+        params.append(avatar_box_id)
+    params.append(entity_id)
+    
+    with conn:
+        cursor = conn.execute(f"UPDATE entities SET {', '.join(updates)} WHERE id = ?", params)
+        success = cursor.rowcount > 0
+    conn.close()
+    return success
+
+def delete_entity(entity_id: int, db_path: Optional[str] = None) -> bool:
+    """Deletes an entity and resets associated boxes to UNASSIGNED."""
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute("UPDATE detected_boxes SET entity_id = NULL, status = 'UNASSIGNED' WHERE entity_id = ?", (entity_id,))
+        cursor = conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
+        success = cursor.rowcount > 0
+    conn.close()
+    return success
+
+def insert_detected_box(box_data: Dict[str, Any], db_path: Optional[str] = None) -> int:
+    """Inserts a detected bounding box."""
+    import time
+    conn = get_connection(db_path)
+    if "created_at" not in box_data:
+        box_data["created_at"] = time.time()
+    fields = list(box_data.keys())
+    placeholders = [f":{f}" for f in fields]
+    sql = f"INSERT INTO detected_boxes ({', '.join(fields)}) VALUES ({', '.join(placeholders)}) RETURNING id;"
+    with conn:
+        cursor = conn.execute(sql, box_data)
+        box_id = cursor.fetchone()[0]
+    conn.close()
+    return box_id
+
+def get_boxes_for_photo(photo_id: int, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Retrieves all detected boxes for a photo joined with entity name and type."""
+    conn = get_connection(db_path)
+    sql = """
+    SELECT 
+        b.*,
+        e.name as entity_name,
+        e.entity_type
+    FROM detected_boxes b
+    LEFT JOIN entities e ON b.entity_id = e.id
+    WHERE b.photo_id = ? AND b.status != 'REJECTED'
+    ORDER BY b.confidence DESC
+    """
+    cursor = conn.execute(sql, (photo_id,))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_box_by_id(box_id: int, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieves single box by ID with photo and entity information."""
+    conn = get_connection(db_path)
+    sql = """
+    SELECT 
+        b.*,
+        p.file_path,
+        p.file_name,
+        p.width,
+        p.height,
+        e.name as entity_name,
+        e.entity_type
+    FROM detected_boxes b
+    JOIN photos p ON b.photo_id = p.id
+    LEFT JOIN entities e ON b.entity_id = e.id
+    WHERE b.id = ?
+    """
+    cursor = conn.execute(sql, (box_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def update_box_entity(box_id: int, entity_id: Optional[int], status: str = "CONFIRMED", match_confidence: float = 1.0, db_path: Optional[str] = None) -> bool:
+    """Assigns or updates entity and status for a detected box."""
+    import time
+    conn = get_connection(db_path)
+    now = time.time()
+    with conn:
+        cursor = conn.execute(
+            "UPDATE detected_boxes SET entity_id = ?, status = ?, match_confidence = ?, reviewed_at = ? WHERE id = ?",
+            (entity_id, status, match_confidence, now, box_id)
+        )
+        success = cursor.rowcount > 0
+    conn.close()
+    return success
+
+def update_box_dimensions(
+    box_id: int,
+    x_min: float,
+    y_min: float,
+    x_max: float,
+    y_max: float,
+    db_path: Optional[str] = None
+) -> bool:
+    """Updates the normalized boundary coordinates of a box."""
+    conn = get_connection(db_path)
+    with conn:
+        cursor = conn.execute(
+            "UPDATE detected_boxes SET x_min = ?, y_min = ?, x_max = ?, y_max = ? WHERE id = ?",
+            (x_min, y_min, x_max, y_max, box_id)
+        )
+        success = cursor.rowcount > 0
+    conn.close()
+    return success
+
+
+def confirm_box(box_id: int, entity_id: Optional[int] = None, db_path: Optional[str] = None) -> bool:
+    """Confirms an auto-tagged or manual box suggestion."""
+    import time
+    conn = get_connection(db_path)
+    now = time.time()
+    with conn:
+        if entity_id is not None:
+            cursor = conn.execute(
+                "UPDATE detected_boxes SET entity_id = ?, status = 'CONFIRMED', reviewed_at = ? WHERE id = ?",
+                (entity_id, now, box_id)
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE detected_boxes SET status = 'CONFIRMED', reviewed_at = ? WHERE id = ? AND entity_id IS NOT NULL",
+                (now, box_id)
+            )
+        success = cursor.rowcount > 0
+    conn.close()
+    return success
+
+def reject_box(box_id: int, db_path: Optional[str] = None) -> bool:
+    """Rejects an auto-tagged box suggestion."""
+    import time
+    conn = get_connection(db_path)
+    now = time.time()
+    with conn:
+        cursor = conn.execute(
+            "UPDATE detected_boxes SET status = 'REJECTED', reviewed_at = ? WHERE id = ?",
+            (now, box_id)
+        )
+        success = cursor.rowcount > 0
+    conn.close()
+    return success
+
+def batch_confirm_boxes(box_ids: List[int], db_path: Optional[str] = None) -> int:
+    """Confirms multiple boxes at once."""
+    if not box_ids:
+        return 0
+    import time
+    now = time.time()
+    conn = get_connection(db_path)
+    placeholders = ",".join("?" for _ in box_ids)
+    sql = f"UPDATE detected_boxes SET status = 'CONFIRMED', reviewed_at = ? WHERE id IN ({placeholders}) AND entity_id IS NOT NULL"
+    with conn:
+        cursor = conn.execute(sql, [now] + box_ids)
+        count = cursor.rowcount
+    conn.close()
+    return count
+
+def get_pending_review_boxes(limit: int = 60, offset: int = 0, entity_id: Optional[int] = None, db_path: Optional[str] = None) -> Tuple[List[Dict[str, Any]], int]:
+    """Retrieves all high-confidence auto-matches waiting for user review."""
+    conn = get_connection(db_path)
+    filter_clause = "b.status = 'PENDING_REVIEW'"
+    params: List[Any] = []
+    if entity_id is not None:
+        filter_clause += " AND b.entity_id = ?"
+        params.append(entity_id)
+    
+    count_cursor = conn.execute(f"SELECT COUNT(*) FROM detected_boxes b WHERE {filter_clause}", params)
+    total = count_cursor.fetchone()[0]
+
+    sql = f"""
+    SELECT 
+        b.*,
+        p.file_path,
+        p.file_name,
+        p.date_taken,
+        e.name as entity_name,
+        e.entity_type
+    FROM detected_boxes b
+    JOIN photos p ON b.photo_id = p.id
+    JOIN entities e ON b.entity_id = e.id
+    WHERE {filter_clause}
+    ORDER BY b.match_confidence DESC, b.id DESC
+    LIMIT ? OFFSET ?
+    """
+    cursor = conn.execute(sql, params + [limit, offset])
+    items = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return items, total
+
+def delete_box(box_id: int, db_path: Optional[str] = None) -> bool:
+    """Deletes a detected box."""
+    conn = get_connection(db_path)
+    with conn:
+        cursor = conn.execute("DELETE FROM detected_boxes WHERE id = ?", (box_id,))
+        success = cursor.rowcount > 0
+    conn.close()
+    return success
+
+def delete_boxes_for_photo(photo_id: int, db_path: Optional[str] = None) -> int:
+    """Deletes all detected boxes for a photo."""
+    conn = get_connection(db_path)
+    with conn:
+        cursor = conn.execute("DELETE FROM detected_boxes WHERE photo_id = ?", (photo_id,))
+        count = cursor.rowcount
+    conn.close()
+    return count
+
+def get_confirmed_embeddings_for_entities(db_path: Optional[str] = None) -> Dict[int, List[List[float]]]:
+    """Retrieves all confirmed 512-d embeddings grouped by entity_id for matching."""
+    conn = get_connection(db_path)
+    sql = """
+    SELECT entity_id, embedding_json 
+    FROM detected_boxes 
+    WHERE status = 'CONFIRMED' AND entity_id IS NOT NULL AND embedding_json IS NOT NULL
+    """
+    cursor = conn.execute(sql)
+    results: Dict[int, List[List[float]]] = {}
+    for row in cursor.fetchall():
+        eid = row["entity_id"]
+        raw = row["embedding_json"]
+        if raw:
+            try:
+                emb = json.loads(raw)
+                if isinstance(emb, list) and len(emb) > 0:
+                    if eid not in results:
+                        results[eid] = []
+                    results[eid].append(emb)
+            except Exception:
+                continue
+    conn.close()
+    return results
+
+def get_unassigned_boxes(
+    limit: int = 60,
+    offset: int = 0,
+    box_type: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Retrieves detected face/pet boxes that are not yet named/assigned to an entity."""
+    conn = get_connection(db_path)
+    filter_clauses = ["(b.entity_id IS NULL OR b.status = 'UNASSIGNED') AND b.status != 'REJECTED'"]
+    params: List[Any] = []
+    if box_type and box_type != "ALL":
+        filter_clauses.append("b.box_type = ?")
+        params.append(box_type.upper())
+
+    where_str = " WHERE " + " AND ".join(filter_clauses)
+    
+    count_cursor = conn.execute(f"SELECT COUNT(*) FROM detected_boxes b {where_str}", params)
+    total = count_cursor.fetchone()[0]
+
+    sql = f"""
+    SELECT 
+        b.*,
+        p.file_path,
+        p.file_name,
+        p.date_taken,
+        p.width,
+        p.height
+    FROM detected_boxes b
+    JOIN photos p ON b.photo_id = p.id
+    {where_str}
+    ORDER BY b.confidence DESC, b.id DESC
+    LIMIT ? OFFSET ?
+    """
+    cursor = conn.execute(sql, params + [limit, offset])
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows, total
+
+def resolve_duplicate_photo_entity_assignments(db_path: Optional[str] = None) -> int:
+    """
+    Enforces the single-identity constraint per photo across the entire library.
+    If multiple boxes in the same photo are assigned to the same entity, the box with
+    the highest priority (CONFIRMED status > match_confidence > confidence > earlier id)
+    retains the assignment. All other duplicate boxes for that entity in the same photo
+    are unlinked and reset to UNASSIGNED.
+    Returns the number of duplicate boxes that were resolved/unlinked.
+    """
+    conn = get_connection(db_path)
+    cursor = conn.execute("""
+        SELECT photo_id, entity_id, COUNT(*) as cnt
+        FROM detected_boxes
+        WHERE entity_id IS NOT NULL AND status != 'REJECTED'
+        GROUP BY photo_id, entity_id
+        HAVING cnt > 1
+    """)
+    duplicates = cursor.fetchall()
+    unlinked_count = 0
+
+    for row in duplicates:
+        photo_id = row["photo_id"]
+        entity_id = row["entity_id"]
+
+        box_cursor = conn.execute("""
+            SELECT id, status, match_confidence, confidence
+            FROM detected_boxes
+            WHERE photo_id = ? AND entity_id = ? AND status != 'REJECTED'
+        """, (photo_id, entity_id))
+        boxes = [dict(b) for b in box_cursor.fetchall()]
+
+        def sort_key(b):
+            is_confirmed = 1 if b.get("status") == "CONFIRMED" else 0
+            match_conf = b.get("match_confidence") or 0.0
+            det_conf = b.get("confidence") or 0.0
+            return (is_confirmed, match_conf, det_conf, -b["id"])
+
+        sorted_boxes = sorted(boxes, key=sort_key, reverse=True)
+        loser_boxes = sorted_boxes[1:]
+        for loser in loser_boxes:
+            conn.execute("""
+                UPDATE detected_boxes
+                SET entity_id = NULL, status = 'UNASSIGNED', match_confidence = 0.0
+                WHERE id = ?
+            """, (loser["id"],))
+            unlinked_count += 1
+
+    conn.commit()
+    conn.close()
+    return unlinked_count

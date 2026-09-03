@@ -151,7 +151,7 @@ export default function ScanModal({ isOpen, onClose, onScanFinished }) {
                 color: '#ffffff',
                 width: '100%'
               }}
-              placeholder="e.g. C:\Users\inouy\photos\sample_library\vacation_2025"
+              placeholder="e.g. C:\Photos\vacation_2025 or ./sample_library"
               value={folderPath}
               onChange={(e) => setFolderPath(e.target.value)}
               onBlur={() => folderPath && loadDirectory(folderPath)}

@@ -6,9 +6,10 @@ Determines the optimal primary keeper based on resolution, metadata richness, an
 
 import uuid
 import sqlite3
-from typing import List, Dict, Any, Tuple, Optional
+from collections import defaultdict, deque
+from typing import List, Dict, Any, Tuple, Optional, Set
 import imagehash
-from backend.database import get_connection, DB_PATH
+from backend.database import get_connection, DB_PATH, get_dismissed_pairs_set
 
 def fast_hamming(int1: int, int2: int) -> int:
     """Computes bitwise Hamming distance between two pre-converted integer hashes in nanoseconds."""
@@ -45,81 +46,114 @@ def select_best_primary(photos: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return max(photos, key=score_photo)
 
-def run_deduplication_pass(db_path: Optional[str] = None) -> int:
+def run_deduplication_pass(db_path: Optional[str] = None, force_recluster: bool = False) -> int:
     """
-    Performs full deduplication clustering across indexed photos:
-    1. Exact match clustering via SHA-256.
-    2. Perceptual match clustering via pHash (hamming distance <= 6).
-    Updates `photos` table and `duplicate_groups` table.
-    Returns the number of duplicate groups created or updated.
+    Performs fast, scalable duplicate clustering across indexed photos:
+    1. Reconciles existing duplicate groups (preserves user curation & keeper choices).
+    2. Exact match clustering via SHA-256.
+    3. High-speed multi-index bucketing pHash clustering (Pigeonhole 8-band indexing).
+    4. Respects user-dismissed duplicate pairs so dismissed false-positives are never re-grouped.
+    Returns the total number of active duplicate groups.
     """
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
-    # Reset existing duplicate state for fresh clustering
-    cursor.execute("""
-    UPDATE photos 
-    SET duplicate_group_id = NULL, is_primary = 1, duplicate_count = 0
-    """)
-    cursor.execute("DELETE FROM duplicate_groups")
-    conn.commit()
+    # Step 0: Load user-dismissed pairs (min_id, max_id)
+    dismissed_pairs = get_dismissed_pairs_set(db_path)
 
-    # Step 1: Find Exact Hash duplicates (SHA-256)
+    # Clean up any dead/stale groups that have <= 1 active non-trashed photos
+    cursor.execute("SELECT id FROM duplicate_groups")
+    existing_group_ids = [r["id"] for r in cursor.fetchall()]
+    for gid in existing_group_ids:
+        cursor.execute("""
+            SELECT id FROM photos WHERE duplicate_group_id = ? AND is_trashed = 0
+        """, (gid,))
+        active_members = cursor.fetchall()
+        if len(active_members) <= 1:
+            cleanup_duplicate_group(gid, db_path)
+
+    # If force_recluster is requested, uncluster items not part of protected groups
+    if force_recluster:
+        cursor.execute("""
+            UPDATE photos 
+            SET duplicate_group_id = NULL, is_primary = 1, duplicate_count = 0
+            WHERE is_trashed = 0
+        """)
+        cursor.execute("DELETE FROM duplicate_groups")
+        conn.commit()
+
+    # Step 1: Find Exact Hash duplicates (SHA-256) for unclustered photos
     cursor.execute("""
-    SELECT sha256, COUNT(*) as count 
-    FROM photos 
-    WHERE sha256 IS NOT NULL AND classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO') AND is_trashed = 0
-    GROUP BY sha256 
-    HAVING count > 1
+        SELECT sha256, COUNT(*) as count 
+        FROM photos 
+        WHERE sha256 IS NOT NULL 
+          AND duplicate_group_id IS NULL
+          AND classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO') 
+          AND is_trashed = 0
+        GROUP BY sha256 
+        HAVING count > 1
     """)
     exact_hash_groups = cursor.fetchall()
-
-    created_groups_count = 0
 
     for row in exact_hash_groups:
         sha = row["sha256"]
         cursor.execute("""
-        SELECT id, file_path, file_size, width, height, classification, date_taken, camera_make
-        FROM photos 
-        WHERE sha256 = ? AND is_trashed = 0
+            SELECT id, file_path, file_size, width, height, classification, date_taken, camera_make
+            FROM photos 
+            WHERE sha256 = ? AND duplicate_group_id IS NULL AND is_trashed = 0
         """, (sha,))
         members = [dict(r) for r in cursor.fetchall()]
         if len(members) <= 1:
             continue
 
-        group_id = f"exact_{uuid.uuid4().hex[:12]}"
-        primary = select_best_primary(members)
-        primary_id = primary["id"]
+        # Filter out pairs that were dismissed by user
+        allowed_members = []
+        for m in members:
+            # Check if this member is dismissed with all others
+            is_dismissed_with_all = False
+            for other in allowed_members:
+                pair = (min(m["id"], other["id"]), max(m["id"], other["id"]))
+                if pair in dismissed_pairs:
+                    is_dismissed_with_all = True
+                    break
+            if not is_dismissed_with_all:
+                allowed_members.append(m)
 
-        wasted_bytes = sum(m["file_size"] for m in members if m["id"] != primary_id)
+        if len(allowed_members) <= 1:
+            continue
+
+        group_id = f"exact_{uuid.uuid4().hex[:12]}"
+        primary = select_best_primary(allowed_members)
+        primary_id = primary["id"]
+        wasted_bytes = sum(m["file_size"] for m in allowed_members if m["id"] != primary_id)
         
         cursor.execute("""
-        INSERT INTO duplicate_groups (id, primary_photo_id, match_type, total_items, total_wasted_bytes, created_at)
-        VALUES (?, ?, 'EXACT_HASH', ?, ?, strftime('%s', 'now'))
-        """, (group_id, primary_id, len(members), wasted_bytes))
+            INSERT INTO duplicate_groups (id, primary_photo_id, match_type, total_items, total_wasted_bytes, created_at)
+            VALUES (?, ?, 'EXACT_HASH', ?, ?, strftime('%s', 'now'))
+        """, (group_id, primary_id, len(allowed_members), wasted_bytes))
 
-        # Update member photos
-        for m in members:
+        for m in allowed_members:
             is_p = 1 if m["id"] == primary_id else 0
             cursor.execute("""
-            UPDATE photos 
-            SET duplicate_group_id = ?, is_primary = ?, duplicate_count = ?
-            WHERE id = ?
-            """, (group_id, is_p, len(members) - 1, m["id"]))
-
-        created_groups_count += 1
+                UPDATE photos 
+                SET duplicate_group_id = ?, is_primary = ?, duplicate_count = ?
+                WHERE id = ?
+            """, (group_id, is_p, len(allowed_members) - 1, m["id"]))
 
     conn.commit()
 
-    # Step 2: Find Perceptual pHash near-duplicates (for items not already in an exact duplicate group)
+    # Step 2: High-Speed Multi-Index Bucketing for pHash near-duplicates
     cursor.execute("""
-    SELECT id, file_path, file_size, width, height, classification, date_taken, camera_make, phash
-    FROM photos 
-    WHERE phash IS NOT NULL AND duplicate_group_id IS NULL AND classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO') AND is_trashed = 0
+        SELECT id, file_path, file_size, width, height, classification, date_taken, camera_make, phash
+        FROM photos 
+        WHERE phash IS NOT NULL 
+          AND duplicate_group_id IS NULL 
+          AND classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO') 
+          AND is_trashed = 0
     """)
     raw_phash_candidates = [dict(r) for r in cursor.fetchall()]
 
-    # Pre-parse hex hashes to integers for ultra-fast bitwise comparisons
+    # Parse hex to 64-bit integer
     phash_candidates = []
     for r in raw_phash_candidates:
         try:
@@ -127,48 +161,87 @@ def run_deduplication_pass(db_path: Optional[str] = None) -> int:
         except Exception:
             pass
 
-    visited_ids = set()
-    for i in range(len(phash_candidates)):
-        p1, int1 = phash_candidates[i]
-        if p1["id"] in visited_ids:
-            continue
+    if len(phash_candidates) > 1:
+        # 8-band bucket indexing: 64 bits divided into 8 1-byte chunks (0..255).
+        # Any pair with Hamming distance <= 6 MUST have at least 8 - 6 = 2 identical chunks.
+        # Indexing by (chunk_idx, byte_value) lets us compare only bucket-sharing candidates in O(N).
+        buckets = defaultdict(list)
+        for idx, (photo, hash_int) in enumerate(phash_candidates):
+            for chunk_idx in range(8):
+                byte_val = (hash_int >> (chunk_idx * 8)) & 0xFF
+                buckets[(chunk_idx, byte_val)].append(idx)
 
-        cluster = [p1]
-        for j in range(i + 1, len(phash_candidates)):
-            p2, int2 = phash_candidates[j]
-            if p2["id"] in visited_ids:
+        # Generate candidate pairs from buckets
+        candidate_pairs = set()
+        for idx_list in buckets.values():
+            if len(idx_list) > 1:
+                for i in range(len(idx_list)):
+                    idx1 = idx_list[i]
+                    for j in range(i + 1, len(idx_list)):
+                        idx2 = idx_list[j]
+                        pair = (idx1, idx2) if idx1 < idx2 else (idx2, idx1)
+                        candidate_pairs.add(pair)
+
+        # Verify candidate pairs against Hamming distance <= 6 and dismissed_pairs
+        adjacency = defaultdict(set)
+        for idx1, idx2 in candidate_pairs:
+            p1, int1 = phash_candidates[idx1]
+            p2, int2 = phash_candidates[idx2]
+            pair_ids = (min(p1["id"], p2["id"]), max(p1["id"], p2["id"]))
+            if pair_ids in dismissed_pairs:
                 continue
 
             dist = (int1 ^ int2).bit_count()
-            if dist <= 6:  # Strict visual resemblance threshold
-                cluster.append(p2)
-                visited_ids.add(p2["id"])
+            if dist <= 6:
+                adjacency[idx1].add(idx2)
+                adjacency[idx2].add(idx1)
 
-        if len(cluster) > 1:
-            visited_ids.add(p1["id"])
-            group_id = f"phash_{uuid.uuid4().hex[:12]}"
-            primary = select_best_primary(cluster)
-            primary_id = primary["id"]
-            wasted_bytes = sum(m["file_size"] for m in cluster if m["id"] != primary_id)
+        # Graph connected components for mathematically consistent clustering
+        visited = set()
+        for start_idx in adjacency:
+            if start_idx in visited:
+                continue
 
-            cursor.execute("""
-            INSERT INTO duplicate_groups (id, primary_photo_id, match_type, total_items, total_wasted_bytes, created_at)
-            VALUES (?, ?, 'PERCEPTUAL_PHASH', ?, ?, strftime('%s', 'now'))
-            """, (group_id, primary_id, len(cluster), wasted_bytes))
+            cluster_indices = []
+            queue = deque([start_idx])
+            visited.add(start_idx)
 
-            for m in cluster:
-                is_p = 1 if m["id"] == primary_id else 0
+            while queue:
+                curr = queue.popleft()
+                cluster_indices.append(curr)
+                for neighbor in adjacency[curr]:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+
+            if len(cluster_indices) > 1:
+                cluster_photos = [phash_candidates[ci][0] for ci in cluster_indices]
+                group_id = f"phash_{uuid.uuid4().hex[:12]}"
+                primary = select_best_primary(cluster_photos)
+                primary_id = primary["id"]
+                wasted_bytes = sum(m["file_size"] for m in cluster_photos if m["id"] != primary_id)
+
                 cursor.execute("""
-                UPDATE photos 
-                SET duplicate_group_id = ?, is_primary = ?, duplicate_count = ?
-                WHERE id = ?
-                """, (group_id, is_p, len(cluster) - 1, m["id"]))
+                    INSERT INTO duplicate_groups (id, primary_photo_id, match_type, total_items, total_wasted_bytes, created_at)
+                    VALUES (?, ?, 'PERCEPTUAL_PHASH', ?, ?, strftime('%s', 'now'))
+                """, (group_id, primary_id, len(cluster_photos), wasted_bytes))
 
-            created_groups_count += 1
+                for m in cluster_photos:
+                    is_p = 1 if m["id"] == primary_id else 0
+                    cursor.execute("""
+                        UPDATE photos 
+                        SET duplicate_group_id = ?, is_primary = ?, duplicate_count = ?
+                        WHERE id = ?
+                    """, (group_id, is_p, len(cluster_photos) - 1, m["id"]))
 
     conn.commit()
+
+    # Return total active duplicate groups
+    cursor.execute("SELECT COUNT(*) FROM duplicate_groups")
+    total_groups = cursor.fetchone()[0]
     conn.close()
-    return created_groups_count
+    return total_groups
+
 
 def cleanup_duplicate_group(group_id: Optional[str], db_path: Optional[str] = None) -> None:
     """

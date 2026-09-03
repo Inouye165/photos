@@ -1,5 +1,5 @@
 import React from 'react';
-import { Camera, Copy, ShieldAlert, FolderSearch, Sparkles, RefreshCw, Smartphone, Trash2 } from 'lucide-react';
+import { Camera, Copy, ShieldAlert, FolderSearch, Sparkles, RefreshCw, Smartphone, Trash2, User } from 'lucide-react';
 
 export default function Header({
   activeTab,
@@ -35,6 +35,27 @@ export default function Header({
           {stats?.total_photos !== undefined && (
             <span className="nav-badge">{stats.total_photos.toLocaleString()}</span>
           )}
+        </button>
+
+        <button
+          className={`nav-tab-btn tab-people ${activeTab === 'people-pets' ? 'active' : ''}`}
+          onClick={() => setActiveTab('people-pets')}
+        >
+          <User size={16} />
+          <span>People & Pets</span>
+          {stats?.total_pending_boxes > 0 ? (
+            <span
+              className="nav-badge"
+              style={{ background: 'rgba(245, 158, 11, 0.35)', color: '#fde68a', fontWeight: 700, border: '1px solid rgba(245, 158, 11, 0.5)' }}
+              title={`${stats.total_pending_boxes} strong matches need confirmation`}
+            >
+              {stats.total_pending_boxes} new
+            </span>
+          ) : (stats?.total_people !== undefined && stats?.total_pets !== undefined && (stats.total_people + stats.total_pets) > 0) ? (
+            <span className="nav-badge">
+              {stats.total_people + stats.total_pets}
+            </span>
+          ) : null}
         </button>
 
         <button

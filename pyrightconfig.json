@@ -5,9 +5,7 @@
   ],
   "extraPaths": [
     ".",
-    "backend",
-    "C:/Python313/Lib/site-packages",
-    "C:/Users/inouy/AppData/Roaming/Python/Python313/site-packages"
+    "backend"
   ],
   "pythonPlatform": "Windows",
   "pythonVersion": "3.13"
