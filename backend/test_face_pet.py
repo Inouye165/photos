@@ -228,10 +228,69 @@ def test_mutual_exclusion_and_duplicate_resolution():
         conn.commit()
         conn.close()
 
+def test_redundant_pet_face_cleanup_and_suppression():
+    from backend.app import cleanup_redundant_boxes
+
+    # 1. Create a dummy photo and entity
+    conn = get_connection()
+    cur = conn.execute("INSERT INTO photos (file_path, file_name, file_size, file_extension, sha256, indexed_at) VALUES ('test_pet_cleanup.jpg', 'test_pet_cleanup.jpg', 100, '.jpg', 'hashpet123', 1000.0)")
+    photo_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    pet_entity = get_or_create_entity("Test Dobby Dog", "PET")
+    eid = pet_entity["id"]
+
+    try:
+        # Outer PET box (whole dog)
+        pet_box_id = insert_detected_box({
+            "photo_id": photo_id,
+            "entity_id": eid,
+            "box_type": "PET",
+            "label": "dog",
+            "confidence": 0.95,
+            "x_min": 0.1, "y_min": 0.1, "x_max": 0.8, "y_max": 0.8,
+            "status": "CONFIRMED",
+            "match_confidence": 1.0
+        })
+
+        # Nested unassigned face box (e.g. snout detected as face)
+        face_box_id = insert_detected_box({
+            "photo_id": photo_id,
+            "entity_id": None,
+            "box_type": "FACE",
+            "label": "person",
+            "confidence": 0.85,
+            "x_min": 0.4, "y_min": 0.4, "x_max": 0.55, "y_max": 0.55,
+            "status": "UNASSIGNED",
+            "match_confidence": 0.0
+        })
+
+        # Run cleanup
+        cleanup_redundant_boxes(photo_id, pet_box_id)
+
+        # Verify face box was cleaned up (deleted)
+        remaining_face = get_box_by_id(face_box_id)
+        assert remaining_face is None
+
+        # Verify pet box remains intact
+        remaining_pet = get_box_by_id(pet_box_id)
+        assert remaining_pet is not None
+        assert remaining_pet["status"] == "CONFIRMED"
+
+        delete_box(pet_box_id)
+    finally:
+        delete_entity(eid)
+        conn = get_connection()
+        conn.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+        conn.commit()
+        conn.close()
+
 if __name__ == "__main__":
     test_database_entity_and_boxes_crud()
     test_detector_embedding_and_matching()
     test_api_endpoints()
     test_mutual_exclusion_and_duplicate_resolution()
+    test_redundant_pet_face_cleanup_and_suppression()
     print("ALL TESTS COMPLETED SUCCESSFULLY!")
 

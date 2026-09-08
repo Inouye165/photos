@@ -31,12 +31,19 @@ export default function BoundingBoxOverlay({
   containerRef,
   onBoxesUpdated,
   isDrawMode = false,
-  setIsDrawMode
+  setIsDrawMode,
+  selectedBoxId: externalSelectedBoxId,
+  onSelectBox
 }) {
   const [boxes, setBoxes] = useState([]);
   const [entities, setEntities] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [selectedBoxId, setSelectedBoxId] = useState(null);
+  const [internalSelectedBoxId, setInternalSelectedBoxId] = useState(null);
+  const selectedBoxId = externalSelectedBoxId !== undefined ? externalSelectedBoxId : internalSelectedBoxId;
+  const setSelectedBoxId = useCallback((id) => {
+    setInternalSelectedBoxId(id);
+    onSelectBox?.(id);
+  }, [onSelectBox]);
   const [hoveredBoxId, setHoveredBoxId] = useState(null);
   
   // Tagging popover state
@@ -208,19 +215,53 @@ export default function BoundingBoxOverlay({
     });
   };
 
-  // Start Moving Bounding Box
+  // Helper to find all boxes containing relative coordinate (relX, relY) sorted by smallest area first
+  const getBoxesAtPoint = useCallback((relX, relY) => {
+    return boxes
+      .filter((b) => relX >= b.x_min && relX <= b.x_max && relY >= b.y_min && relY <= b.y_max)
+      .sort((a, b) => {
+        const areaA = (a.x_max - a.x_min) * (a.y_max - a.y_min);
+        const areaB = (b.x_max - b.x_min) * (b.y_max - b.y_min);
+        return areaA - areaB;
+      });
+  }, [boxes]);
+
+  // Start Moving Bounding Box / Selection
   const handleBoxMouseDown = (e, box) => {
     if (e.target.closest('.box-popover') || e.target.closest('.box-action-btn') || e.target.closest('.box-resize-handle')) return;
     e.stopPropagation();
-    setSelectedBoxId(box.id);
-    if (!box.entity_name) {
-      setEditingBoxId(box.id);
-      setInputName('');
-    }
+
     if (!imageRef?.current) return;
     const imgRect = imageRef.current.getBoundingClientRect();
     const relX = (e.clientX - imgRect.left) / imgRect.width;
     const relY = (e.clientY - imgRect.top) / imgRect.height;
+
+    // Check for overlapping boxes under the mouse click
+    const hitBoxes = getBoxesAtPoint(relX, relY);
+
+    // If clicking an already selected box and there are other overlapping boxes at this coordinate,
+    // cycle selection to the next overlapping box!
+    if (hitBoxes.length > 1 && selectedBoxId === box.id) {
+      const currentIndex = hitBoxes.findIndex((b) => b.id === selectedBoxId);
+      const nextBox = hitBoxes[(currentIndex + 1) % hitBoxes.length];
+      setSelectedBoxId(nextBox.id);
+      if (!nextBox.entity_name) {
+        setEditingBoxId(nextBox.id);
+        setInputName('');
+        setShowSuggestions(true);
+      } else {
+        setEditingBoxId(null);
+      }
+      return;
+    }
+
+    setSelectedBoxId(box.id);
+    if (!box.entity_name) {
+      setEditingBoxId(box.id);
+      setInputName('');
+      setShowSuggestions(true);
+    }
+
     setMovingBox({
       boxId: box.id,
       origBox: { ...box },
@@ -493,99 +534,137 @@ export default function BoundingBoxOverlay({
         </div>
       )}
 
-      {/* Existing Detected Boxes */}
-      {boxes.map((box) => {
-        const x = box.x_min * imgLayout.width;
-        const y = box.y_min * imgLayout.height;
-        const w = (box.x_max - box.x_min) * imgLayout.width;
-        const h = (box.y_max - box.y_min) * imgLayout.height;
+      {/* Existing Detected Boxes (sorted by area descending so smaller boxes naturally stack on top) */}
+      {[...boxes]
+        .sort((a, b) => {
+          const areaA = (a.x_max - a.x_min) * (a.y_max - a.y_min);
+          const areaB = (b.x_max - b.x_min) * (b.y_max - b.y_min);
+          return areaB - areaA;
+        })
+        .map((box) => {
+          const x = box.x_min * imgLayout.width;
+          const y = box.y_min * imgLayout.height;
+          const w = (box.x_max - box.x_min) * imgLayout.width;
+          const h = (box.y_max - box.y_min) * imgLayout.height;
 
-        const isSelected = selectedBoxId === box.id;
-        const isHovered = hoveredBoxId === box.id;
-        const isEditing = editingBoxId === box.id;
-        const isPending = box.status === 'PENDING_REVIEW';
-        const isConfirmed = box.status === 'CONFIRMED';
-        const isPet = box.box_type === 'PET' || box.entity_type === 'PET';
+          const area = (box.x_max - box.x_min) * (box.y_max - box.y_min);
+          // Smaller boxes have higher baseZ (e.g. 45 vs 25) so they float on top
+          const baseZ = Math.min(48, 20 + Math.round((1 - Math.min(1, area)) * 25));
 
-        // Color coding
-        let borderColor = 'rgba(99, 102, 241, 0.6)'; // Indigo for unassigned
-        let bgColor = 'rgba(99, 102, 241, 0.12)';
-        if (isConfirmed) {
-          borderColor = 'rgba(16, 185, 129, 0.85)'; // Emerald
-          bgColor = 'rgba(16, 185, 129, 0.12)';
-        } else if (isPending) {
-          borderColor = 'rgba(245, 158, 11, 0.9)'; // Amber gold for pending strong match
-          bgColor = 'rgba(245, 158, 11, 0.15)';
-        }
+          const isSelected = selectedBoxId === box.id;
+          const isHovered = hoveredBoxId === box.id;
+          const isEditing = editingBoxId === box.id;
+          const isPending = box.status === 'PENDING_REVIEW';
+          const isConfirmed = box.status === 'CONFIRMED';
+          const isPet = box.box_type === 'PET' || box.entity_type === 'PET';
 
-        if (isSelected || isHovered) {
-          borderColor = isPending ? '#fbbf24' : isConfirmed ? '#34d399' : '#818cf8';
-        }
+          // Box body elevation: selected gets small elevation (+5), keeping smaller inner boxes above it
+          const boxZ = baseZ + (isSelected ? 5 : isHovered ? 2 : 0);
 
-        const matchPercent = box.match_confidence
-          ? Math.round(box.match_confidence * 100)
-          : null;
+          // Find any unassigned face box inside this box
+          const innerUnassignedBoxes = boxes.filter((b) => {
+            if (b.id === box.id || b.entity_name || b.status !== 'UNASSIGNED') return false;
+            const cx = (b.x_min + b.x_max) / 2;
+            const cy = (b.y_min + b.y_max) / 2;
+            return (
+              cx >= box.x_min - 0.02 &&
+              cx <= box.x_max + 0.02 &&
+              cy >= box.y_min - 0.02 &&
+              cy <= box.y_max + 0.02
+            );
+          });
 
-        return (
-          <div
-            key={box.id}
-            className={`bounding-box-rect ${isPending ? 'pending-glow' : ''} ${isSelected ? 'selected' : ''}`}
-            style={{
-              position: 'absolute',
-              left: `${x}px`,
-              top: `${y}px`,
-              width: `${w}px`,
-              height: `${h}px`,
-              border: `2px solid ${borderColor}`,
-              borderRadius: '6px',
-              backgroundColor: isHovered || isSelected ? bgColor : 'transparent',
-              transition: resizingBox || movingBox ? 'none' : 'all 0.15s ease',
-              cursor: isDrawMode ? 'crosshair' : 'move',
-              zIndex: isSelected || isEditing ? 50 : isHovered ? 40 : 20
-            }}
-            onMouseDown={(e) => handleBoxMouseDown(e, box)}
-            onClick={(e) => {
-              e.stopPropagation();
-              setSelectedBoxId(box.id);
-              if (!box.entity_name) {
-                setEditingBoxId(box.id);
-                setInputName('');
-                setShowSuggestions(true);
-              }
-            }}
-            onMouseEnter={() => setHoveredBoxId(box.id)}
-            onMouseLeave={() => setHoveredBoxId(null)}
-          >
-            {/* Tag Badge on top of box */}
+          // Color coding
+          let borderColor = 'rgba(99, 102, 241, 0.6)'; // Indigo for unassigned
+          let bgColor = 'rgba(99, 102, 241, 0.12)';
+          if (isConfirmed) {
+            borderColor = 'rgba(16, 185, 129, 0.85)'; // Emerald
+            bgColor = 'rgba(16, 185, 129, 0.12)';
+          } else if (isPending) {
+            borderColor = 'rgba(245, 158, 11, 0.9)'; // Amber gold for pending strong match
+            bgColor = 'rgba(245, 158, 11, 0.15)';
+          }
+
+          if (isSelected || isHovered) {
+            borderColor = isPending ? '#fbbf24' : isConfirmed ? '#34d399' : '#818cf8';
+          }
+
+          const matchPercent = box.match_confidence
+            ? Math.round(box.match_confidence * 100)
+            : null;
+
+          return (
             <div
-              className="box-badge-label"
+              key={box.id}
+              className={`bounding-box-rect ${isPending ? 'pending-glow' : ''} ${isSelected ? 'selected' : ''}`}
               style={{
                 position: 'absolute',
-                top: '-24px',
-                left: '-1px',
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: '4px',
-                padding: '2px 8px',
-                fontSize: '0.72rem',
-                fontWeight: 600,
-                borderRadius: '4px 4px 0 0',
-                backgroundColor: isConfirmed ? '#065f46' : isPending ? '#78350f' : '#312e81',
-                color: '#ffffff',
-                border: `1px solid ${borderColor}`,
-                borderBottom: 'none',
-                whiteSpace: 'nowrap',
-                boxShadow: '0 2px 8px rgba(0,0,0,0.4)'
+                left: `${x}px`,
+                top: `${y}px`,
+                width: `${w}px`,
+                height: `${h}px`,
+                border: `2px solid ${borderColor}`,
+                borderRadius: '6px',
+                backgroundColor: isHovered || isSelected ? bgColor : 'transparent',
+                transition: resizingBox || movingBox ? 'none' : 'all 0.15s ease',
+                cursor: isDrawMode ? 'crosshair' : 'move',
+                zIndex: boxZ
               }}
+              onMouseDown={(e) => handleBoxMouseDown(e, box)}
+              onClick={(e) => {
+                e.stopPropagation();
+                setSelectedBoxId(box.id);
+                if (!box.entity_name) {
+                  setEditingBoxId(box.id);
+                  setInputName('');
+                  setShowSuggestions(true);
+                }
+              }}
+              onMouseEnter={() => setHoveredBoxId(box.id)}
+              onMouseLeave={() => setHoveredBoxId(null)}
             >
-              {isPet ? <Heart size={11} color="#f472b6" /> : <User size={11} color="#67e8f9" />}
-              <span>{box.entity_name || (box.label === 'person' ? 'Unnamed Face' : box.label || 'Detect')}</span>
-              {isPending && matchPercent && (
-                <span style={{ color: '#fde68a', fontSize: '0.68rem', marginLeft: '2px' }}>
-                  ({matchPercent}%)
-                </span>
-              )}
-            </div>
+              {/* Tag Badge on top of box */}
+              <div
+                className="box-badge-label"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSelectedBoxId(box.id);
+                  if (!box.entity_name) {
+                    setEditingBoxId(box.id);
+                    setInputName('');
+                    setShowSuggestions(true);
+                  }
+                }}
+                style={{
+                  position: 'absolute',
+                  top: '-24px',
+                  left: '-1px',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  padding: '2px 8px',
+                  fontSize: '0.72rem',
+                  fontWeight: 600,
+                  borderRadius: '4px 4px 0 0',
+                  backgroundColor: isConfirmed ? '#065f46' : isPending ? '#78350f' : '#312e81',
+                  color: '#ffffff',
+                  border: `1px solid ${borderColor}`,
+                  borderBottom: 'none',
+                  whiteSpace: 'nowrap',
+                  boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
+                  cursor: 'pointer',
+                  pointerEvents: 'all',
+                  zIndex: isSelected ? 88 : 82
+                }}
+              >
+                {isPet ? <Heart size={11} color="#f472b6" /> : <User size={11} color="#67e8f9" />}
+                <span>{box.entity_name || (box.label === 'person' ? 'Unnamed Face' : box.label || 'Detect')}</span>
+                {isPending && matchPercent && (
+                  <span style={{ color: '#fde68a', fontSize: '0.68rem', marginLeft: '2px' }}>
+                    ({matchPercent}%)
+                  </span>
+                )}
+              </div>
 
             {/* Corner Resize Handles */}
             {(isSelected || isHovered) && (
@@ -767,6 +846,89 @@ export default function BoundingBoxOverlay({
                         <UserMinus size={12} />
                       </button>
                     </div>
+
+                    {/* Redundant inner unassigned tag helper for named pet/person */}
+                    {innerUnassignedBoxes.length > 0 && (
+                      <div
+                        style={{
+                          marginTop: '8px',
+                          paddingTop: '8px',
+                          borderTop: '1px solid rgba(255, 255, 255, 0.1)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '6px'
+                        }}
+                      >
+                        <div style={{ fontSize: '0.72rem', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '5px' }}>
+                          <Sparkles size={12} color="#f472b6" />
+                          <span>Inner face tag detected inside {box.entity_name}</span>
+                        </div>
+                        <div style={{ display: 'flex', gap: '6px' }}>
+                          <button
+                            type="button"
+                            className="btn-secondary box-action-btn"
+                            style={{
+                              flex: 1,
+                              padding: '3px 8px',
+                              fontSize: '0.7rem',
+                              color: '#38bdf8',
+                              borderColor: 'rgba(56, 189, 248, 0.3)',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              gap: '4px'
+                            }}
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              const faceBox = innerUnassignedBoxes[0];
+                              try {
+                                if (box.entity_id) {
+                                  await setEntityAvatar(box.entity_id, faceBox.id);
+                                }
+                                await deletePhotoBox(photoId, faceBox.id);
+                                setBoxes((prev) => prev.filter((b) => b.id !== faceBox.id));
+                                if (onBoxesUpdated) onBoxesUpdated();
+                              } catch (err) {
+                                alert('Failed to set avatar: ' + err.message);
+                              }
+                            }}
+                            title="Set inner face as profile photo and remove redundant tag"
+                          >
+                            <Camera size={11} />
+                            <span>Use Face as Avatar</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-secondary box-action-btn"
+                            style={{
+                              padding: '3px 8px',
+                              fontSize: '0.7rem',
+                              color: '#f87171',
+                              borderColor: 'rgba(248, 113, 113, 0.3)',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px'
+                            }}
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              try {
+                                for (const fb of innerUnassignedBoxes) {
+                                  await deletePhotoBox(photoId, fb.id);
+                                }
+                                setBoxes((prev) => prev.filter((b) => !innerUnassignedBoxes.some((ib) => ib.id === b.id)));
+                                if (onBoxesUpdated) onBoxesUpdated();
+                              } catch (err) {
+                                alert('Failed to remove extra tag: ' + err.message);
+                              }
+                            }}
+                            title="Remove redundant unassigned face tag since pet is already named"
+                          >
+                            <Trash2 size={11} />
+                            <span>Dismiss Extra</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 

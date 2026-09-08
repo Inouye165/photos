@@ -1,6 +1,8 @@
 import React from 'react';
 import { Camera, Copy, ShieldAlert, FolderSearch, Sparkles, RefreshCw, Smartphone, Trash2, User } from 'lucide-react';
 
+import BackupProgressBar from './BackupProgressBar';
+
 export default function Header({
   activeTab,
   setActiveTab,
@@ -98,6 +100,9 @@ export default function Header({
 
       {/* Header Actions */}
       <div className="header-actions">
+        {/* Conservative Google Drive Backup Progress */}
+        <BackupProgressBar />
+
         <button
           className="btn-secondary"
           onClick={onOpenMobileModal}

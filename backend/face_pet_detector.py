@@ -252,6 +252,26 @@ class FacePetDetector:
         except Exception as e:
             print(f"YOLO detection error: {e}")
 
+        # Filter out false-positive human face detections that are located inside pet bounding boxes
+        pet_boxes = [b for b in boxes if b.get("box_type") == "PET"]
+        if pet_boxes:
+            cleaned_boxes = []
+            for b in boxes:
+                if b.get("box_type") == "FACE" and b.get("label") == "person":
+                    cx = (b["x_min"] + b["x_max"]) / 2
+                    cy = (b["y_min"] + b["y_max"]) / 2
+                    # Check if the face center falls within any detected pet box
+                    is_inside_pet = any(
+                        (pb["x_min"] - 0.02) <= cx <= (pb["x_max"] + 0.02) and
+                        (pb["y_min"] - 0.02) <= cy <= (pb["y_max"] + 0.02)
+                        for pb in pet_boxes
+                    )
+                    if is_inside_pet:
+                        # Animal muzzle/eyes erroneously flagged as human face
+                        continue
+                cleaned_boxes.append(b)
+            boxes = cleaned_boxes
+
         # Remove duplicate or heavily overlapping boxes (IoU suppression)
         filtered = self._non_max_suppression(boxes, iou_thresh=0.6)
         return filtered

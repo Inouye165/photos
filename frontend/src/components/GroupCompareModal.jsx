@@ -19,13 +19,28 @@ import {
   Maximize2,
   Crosshair,
   Undo2,
-  ShieldCheck
+  ShieldCheck,
+  Calendar
 } from 'lucide-react';
 import { batchTagTrash } from '../api';
+
+const formatDate = (dateVal) => {
+  if (!dateVal) return null;
+  const cleaned = String(dateVal).replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3');
+  const d = new Date(cleaned);
+  if (isNaN(d.getTime())) return String(dateVal);
+  return d.toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric'
+  });
+};
 
 export default function GroupCompareModal({
   group,
   groupIndex,
+  groups = [],
+  onNavigateGroup,
   onClose,
   onApplied
 }) {
@@ -371,8 +386,28 @@ export default function GroupCompareModal({
         <header className="compare-modal-header">
           <div className="compare-header-left">
             <div className="compare-title-row">
-              <span className="compare-badge">
-                {group.match_type === 'EXACT_HASH' ? 'Exact SHA-256 Match' : 'Perceptual Visual Match'}
+              <span className="compare-badge" style={{
+                background: group.match_type === 'EXACT_HASH' 
+                  ? 'rgba(245, 158, 11, 0.2)' 
+                  : group.match_type === 'BURST_SEQUENCE'
+                  ? 'rgba(6, 182, 212, 0.2)'
+                  : 'rgba(99, 102, 241, 0.2)',
+                color: group.match_type === 'EXACT_HASH'
+                  ? '#fde68a'
+                  : group.match_type === 'BURST_SEQUENCE'
+                  ? '#67e8f9'
+                  : '#c7d2fe',
+                border: group.match_type === 'EXACT_HASH'
+                  ? '1px solid rgba(245, 158, 11, 0.4)'
+                  : group.match_type === 'BURST_SEQUENCE'
+                  ? '1px solid rgba(6, 182, 212, 0.4)'
+                  : '1px solid rgba(99, 102, 241, 0.4)'
+              }}>
+                {group.match_type === 'EXACT_HASH' 
+                  ? 'Exact SHA-256 Match' 
+                  : group.match_type === 'BURST_SEQUENCE'
+                  ? 'Continuous Burst Sequence'
+                  : 'Visually Similar Match'}
               </span>
               <h2 className="compare-title">
                 Group #{groupIndex + 1} Comparison Studio
@@ -380,6 +415,54 @@ export default function GroupCompareModal({
               <span className="compare-total-count">
                 ({totalCandidates} copies)
               </span>
+
+              {groups && groups.length > 1 && onNavigateGroup && (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', marginLeft: '8px' }}>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    disabled={groupIndex <= 0}
+                    onClick={() => onNavigateGroup(groupIndex - 1)}
+                    style={{
+                      padding: '0.2rem 0.5rem',
+                      fontSize: '0.72rem',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '3px',
+                      borderRadius: '6px',
+                      background: 'rgba(255, 255, 255, 0.06)',
+                      color: groupIndex <= 0 ? '#64748b' : '#cbd5e1'
+                    }}
+                    title="Previous Duplicate Group in sorted order"
+                  >
+                    <ChevronLeft size={13} />
+                    <span>Prev</span>
+                  </button>
+                  <span style={{ fontSize: '0.75rem', color: '#94a3b8', padding: '0 4px' }}>
+                    {groupIndex + 1} / {groups.length}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    disabled={groupIndex >= groups.length - 1}
+                    onClick={() => onNavigateGroup(groupIndex + 1)}
+                    style={{
+                      padding: '0.2rem 0.5rem',
+                      fontSize: '0.72rem',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '3px',
+                      borderRadius: '6px',
+                      background: 'rgba(255, 255, 255, 0.06)',
+                      color: groupIndex >= groups.length - 1 ? '#64748b' : '#cbd5e1'
+                    }}
+                    title="Next Duplicate Group in sorted order"
+                  >
+                    <span>Next</span>
+                    <ChevronRight size={13} />
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Clear, reassuring status summary */}
@@ -699,6 +782,15 @@ export default function GroupCompareModal({
                           </span>
                           <span className="spec-separator">•</span>
                           <span className="spec-size">{formatSize(photo.file_size)}</span>
+                          {photo.date_taken && (
+                            <>
+                              <span className="spec-separator">•</span>
+                              <span className="spec-date" style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', color: '#7dd3fc' }}>
+                                <Calendar size={11} />
+                                {formatDate(photo.date_taken)}
+                              </span>
+                            </>
+                          )}
                         </div>
                         <div className="card-path" title={photo.file_path}>
                           <Folder size={11} style={{ flexShrink: 0, opacity: 0.7 }} />
@@ -866,6 +958,7 @@ export default function GroupCompareModal({
                   <h4>{inspectPhoto.file_name}</h4>
                   <p>
                     {inspectPhoto.width}×{inspectPhoto.height} px • {formatSize(inspectPhoto.file_size)}
+                    {inspectPhoto.date_taken && ` • Date: ${formatDate(inspectPhoto.date_taken)}`}
                   </p>
                 </div>
                 <button

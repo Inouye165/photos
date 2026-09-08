@@ -7,12 +7,19 @@ and live folder scanning progress.
 import os
 import sys
 import threading
+import logging
 from typing import Optional, List, Dict, Any, Tuple
 from fastapi import FastAPI, HTTPException, Query, Body, BackgroundTasks, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+class EndpointFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/backup/status" not in record.getMessage()
+
+logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
 from backend.database import (
     init_db,
@@ -60,6 +67,9 @@ from backend.face_pet_detector import (
     CROPS_CACHE_DIR,
     STRICT_HIGH_CONFIDENCE_THRESHOLD
 )
+from backend.backup_worker import BackupWorker
+from backend.gdrive_service import GDriveService
+from backend.database import update_backup_settings, update_photo_gdrive_status, reset_failed_backups
 
 import shutil
 from contextlib import asynccontextmanager
@@ -86,7 +96,10 @@ async def lifespan(app: FastAPI):
         resolve_duplicate_photo_entity_assignments()
     except Exception as e:
         print(f"Error resolving duplicate entity assignments on startup: {e}")
+    # Start background Google Drive backup worker
+    BackupWorker.get_instance().start()
     yield
+    BackupWorker.get_instance().stop()
 
 app = FastAPI(
     title="LuminaPhoto API",
@@ -168,6 +181,17 @@ class AssignBoxRequest(BaseModel):
 
 class BatchConfirmRequest(BaseModel):
     box_ids: List[int]
+
+class BackupSettingsRequest(BaseModel):
+    hourly_limit: Optional[int] = None
+    delay_seconds: Optional[float] = None
+    root_folder_name: Optional[str] = None
+    is_paused: Optional[bool] = None
+
+class ExchangeCodeRequest(BaseModel):
+    code: str
+    state: Optional[str] = None
+    redirect_uri: Optional[str] = "http://localhost:8500/api/backup/auth/callback"
 
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -624,7 +648,7 @@ def delete_photo(photo_id: int, permanent: bool = False):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to delete file from disk: {str(e)}")
 
-    # 2. Clean up cached thumbnails
+    # Clean up cached thumbnails
     for size_type in ("thumb", "preview"):
         t_path = get_thumbnail_path(photo_id, size_type)
         if os.path.exists(t_path):
@@ -632,6 +656,13 @@ def delete_photo(photo_id: int, permanent: bool = False):
                 os.remove(t_path)
             except Exception:
                 pass
+
+    # Permanently delete from Google Drive if backed up
+    if photo.get("gdrive_file_id"):
+        try:
+            GDriveService.get_instance().delete_photo_permanently(photo["gdrive_file_id"])
+        except Exception as e:
+            print(f"Error deleting photo {photo_id} from Google Drive: {e}")
 
     # 3. Remove from database
     conn = get_connection()
@@ -663,6 +694,24 @@ def toggle_photo_trash(photo_id: int, req: TrashToggleRequest = Body(...)):
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update trash status")
 
+    dup_group_id = photo.get("duplicate_group_id")
+    if dup_group_id:
+        try:
+            cleanup_duplicate_group(dup_group_id)
+        except Exception:
+            pass
+
+    # Sync trash status to Google Drive
+    if not req.is_trashed and photo.get("gdrive_file_id"):
+        try:
+            GDriveService.get_instance().untrash_photo(photo["gdrive_file_id"])
+            update_photo_gdrive_status(photo_id, status="backed_up")
+        except Exception as e:
+            print(f"Error untrashing photo on Google Drive: {e}")
+    
+    # Wake worker to process sync
+    BackupWorker.get_instance().trigger_wake()
+
     action = "tagged for trash (file left in place)" if req.is_trashed else "restored from trash"
     return {
         "message": f"'{photo['file_name']}' {action}",
@@ -688,6 +737,9 @@ def batch_trash_photos(req: BatchTrashRequest = Body(...)):
             pass
 
     count = batch_tag_photo_trash(req.photo_ids, req.is_trashed)
+
+    # Wake backup worker to sync trash/untrash
+    BackupWorker.get_instance().trigger_wake()
 
     for gid in affected_groups:
         try:
@@ -765,13 +817,36 @@ def empty_trash_all(permanent: bool = True):
                 except Exception:
                     pass
 
+        # Permanently delete from Google Drive if backed up
+        if photo.get("gdrive_file_id"):
+            try:
+                GDriveService.get_instance().delete_photo_permanently(photo["gdrive_file_id"])
+            except Exception as e:
+                print(f"Error deleting photo {pid} from Google Drive: {e}")
+
         # 3. Remove DB record
         conn.execute("DELETE FROM photos WHERE id = ?", (pid,))
+
+    # Immediately clean up any dead duplicate groups whose active non-trashed items <= 1
+    conn.execute("""
+        UPDATE photos
+        SET duplicate_group_id = NULL, is_primary = 1, duplicate_count = 0
+        WHERE duplicate_group_id IS NOT NULL
+          AND duplicate_group_id NOT IN (
+              SELECT duplicate_group_id FROM photos WHERE is_primary = 0 AND is_trashed = 0 AND duplicate_group_id IS NOT NULL
+          )
+    """)
+    conn.execute("""
+        DELETE FROM duplicate_groups
+        WHERE id NOT IN (
+            SELECT DISTINCT duplicate_group_id FROM photos WHERE is_trashed = 0 AND duplicate_group_id IS NOT NULL
+        )
+    """)
 
     conn.commit()
     conn.close()
 
-    # Re-run deduplication pass in background thread to avoid blocking HTTP response
+    # Re-run deduplication pass in background thread to discover new clusters
     try:
         threading.Thread(target=run_deduplication_pass, daemon=True).start()
     except Exception:
@@ -903,6 +978,13 @@ def purge_trash_for_space(req: PurgeSpaceRequest = Body(...)):
                 except Exception:
                     pass
 
+        # Permanently delete from Google Drive if backed up
+        if item.get("gdrive_file_id"):
+            try:
+                GDriveService.get_instance().delete_photo_permanently(item["gdrive_file_id"])
+            except Exception as e:
+                print(f"Error deleting photo {pid} from Google Drive: {e}")
+
         # Remove from database
         conn.execute("DELETE FROM photos WHERE id = ?", (pid,))
 
@@ -947,10 +1029,171 @@ def get_purge_history(limit: int = Query(50, ge=1, le=200)):
     logs = get_trash_purge_logs(limit=limit)
     return {"logs": logs}
 
+# =========================================================================
+# Google Drive Backup & Sync Endpoints
+# =========================================================================
+
+@app.get("/api/backup/status")
+def get_backup_status():
+    """Returns real-time Google Drive backup state, quotas, and current progress."""
+    return BackupWorker.get_instance().get_state()
+
+@app.get("/api/backup/auth/url")
+def get_backup_auth_url(redirect_uri: Optional[str] = None):
+    """Generates the direct Google OAuth consent URL for the frontend."""
+    from backend.gdrive_auth import is_configured, create_auth_url
+    if not is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google Drive credentials file ('backend/credentials.json') is missing. "
+                "Please download your OAuth 2.0 Client ID (Desktop App) from Google Cloud Console "
+                "and save it as 'backend/credentials.json'. See README.md for setup instructions."
+            )
+        )
+    uri = redirect_uri or "http://localhost:8500/api/backup/auth/callback"
+    try:
+        url, state = create_auth_url(redirect_uri=uri)
+        return {"auth_url": url, "state": state}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate Google auth URL: {str(e)}")
+
+@app.get("/api/backup/auth/callback", response_class=HTMLResponse)
+def handle_backup_auth_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+    """Handles OAuth redirect from Google, stores credentials token, and wakes worker."""
+    if error:
+        return HTMLResponse(
+            f"<div style='font-family:sans-serif;padding:40px;background:#0f172a;color:#f8fafc;min-height:100vh;'>"
+            f"<h2 style='color:#f87171;'>Google Authorization Failed</h2>"
+            f"<p>{error}</p><a href='/' style='color:#38bdf8;'>Return to LuminaPhoto</a></div>",
+            status_code=400
+        )
+    if not code:
+        return HTMLResponse("<h3>Missing authorization code</h3><a href='/'>Return</a>", status_code=400)
+
+    try:
+        from backend.gdrive_auth import exchange_auth_code
+        exchange_auth_code(code, state=state, redirect_uri="http://localhost:8500/api/backup/auth/callback")
+        GDriveService.get_instance().reset_service()
+        BackupWorker.get_instance().trigger_wake()
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>Google Drive Linked - LuminaPhoto</title>
+          <meta http-equiv="refresh" content="2;url=/?backup_connected=true">
+          <style>
+            body { background: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+            .card { background: #1e293b; border: 1px solid rgba(255,255,255,0.1); padding: 36px 44px; border-radius: 16px; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.6); max-width: 440px; }
+            h2 { color: #34d399; margin-top: 0; font-size: 22px; }
+            p { color: #cbd5e1; font-size: 15px; line-height: 1.5; }
+            .btn { display: inline-block; margin-top: 16px; padding: 10px 20px; background: #10b981; color: white; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 14px; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <h2>✓ Google Drive Connected!</h2>
+            <p>Your Google Drive account has been linked successfully. LuminaPhoto background backup has started.</p>
+            <p style="color: #94a3b8; font-size: 13px;">Returning to your photos...</p>
+            <a href="/?backup_connected=true" class="btn">Return to Photos Now</a>
+          </div>
+        </body>
+        </html>
+        """)
+    except Exception as e:
+        return HTMLResponse(
+            f"<div style='font-family:sans-serif;padding:40px;background:#0f172a;color:#f8fafc;min-height:100vh;'>"
+            f"<h2 style='color:#f87171;'>Error Linking Google Drive</h2>"
+            f"<p>{str(e)}</p><a href='/' style='color:#38bdf8;'>Return to LuminaPhoto</a></div>",
+            status_code=500
+        )
+
+@app.post("/api/backup/auth/exchange")
+def exchange_code_endpoint(req: ExchangeCodeRequest):
+    """Allows manual or frontend programmatic code exchange."""
+    from backend.gdrive_auth import exchange_auth_code
+    exchange_auth_code(req.code, state=req.state, redirect_uri=req.redirect_uri or "http://localhost:8500/api/backup/auth/callback")
+    GDriveService.get_instance().reset_service()
+    BackupWorker.get_instance().trigger_wake()
+    return {"message": "Google Drive connected successfully", "connected": True}
+
+@app.post("/api/backup/auth/start")
+def start_backup_auth():
+    """Launches local OAuth flow in background so browser opens for user consent."""
+    from backend.gdrive_auth import is_configured
+    if not is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google Drive credentials file ('backend/credentials.json') is missing. "
+                "Please download your OAuth 2.0 Client ID (Desktop App) from Google Cloud Console "
+                "and save it as 'backend/credentials.json'. See README.md for setup instructions."
+            )
+        )
+    def auth_thread():
+        try:
+            from backend.gdrive_auth import run_local_auth_flow
+            run_local_auth_flow()
+            GDriveService.get_instance().reset_service()
+            BackupWorker.get_instance().trigger_wake()
+        except Exception as e:
+            print(f"[GDrive Auth Background Error]: {e}")
+
+    threading.Thread(target=auth_thread, daemon=True).start()
+    return {"message": "Google Drive authentication flow initiated in browser"}
+
+@app.post("/api/backup/auth/disconnect")
+def disconnect_backup():
+    """Disconnects Google Drive account and removes credentials token."""
+    from backend.gdrive_auth import disconnect
+    disconnect()
+    GDriveService.get_instance().reset_service()
+    BackupWorker.get_instance().trigger_wake()
+    return {"message": "Disconnected from Google Drive"}
+
+@app.post("/api/backup/pause")
+def pause_backup():
+    """Pauses background photo uploads."""
+    update_backup_settings(is_paused=1)
+    BackupWorker.get_instance().trigger_wake()
+    return {"message": "Backup paused", "is_paused": True}
+
+@app.post("/api/backup/resume")
+def resume_backup():
+    """Resumes background photo uploads."""
+    update_backup_settings(is_paused=0)
+    BackupWorker.get_instance().trigger_wake()
+    return {"message": "Backup resumed", "is_paused": False}
+
+@app.post("/api/backup/settings")
+def save_backup_settings(req: BackupSettingsRequest):
+    """Updates hourly limit, inter-file delay, or target root folder."""
+    paused_val = 1 if req.is_paused else (0 if req.is_paused is False else None)
+    settings = update_backup_settings(
+        hourly_limit=req.hourly_limit,
+        delay_seconds=req.delay_seconds,
+        root_folder_name=req.root_folder_name,
+        is_paused=paused_val
+    )
+    BackupWorker.get_instance().trigger_wake()
+    return settings
+
+@app.post("/api/backup/retry-failed")
+def retry_failed_backups_endpoint():
+    """Resets failed backup attempts to pending and wakes worker to re-attempt."""
+    count = reset_failed_backups()
+    BackupWorker.get_instance().trigger_wake()
+    return {"message": f"Queued {count} failed photo(s) for retry", "retried_count": count}
+
+
 @app.get("/api/duplicates")
-def list_duplicates():
-    """Retrieves all duplicate clusters with primary and duplicate members."""
-    return get_duplicate_groups()
+def list_duplicates(
+    sort_by: Optional[str] = Query(None, description="Field to sort duplicate groups by: count, date, size"),
+    sort_order: Optional[str] = Query(None, description="Sort order: desc or asc"),
+    category: Optional[str] = Query(None, description="Category filter: all, exact, burst, similar")
+):
+    """Retrieves all duplicate clusters with primary and duplicate members, optionally sorted and filtered."""
+    return get_duplicate_groups(sort_by=sort_by, sort_order=sort_order, category=category)
 
 @app.post("/api/duplicates/trash-all")
 def trash_all_duplicates_endpoint():
@@ -1191,6 +1434,75 @@ def get_pending_reviews(
         "offset": offset
     }
 
+def cleanup_redundant_boxes(photo_id: int, target_box_id: int):
+    """
+    Cleans up redundant unassigned boxes for a photo when a box is confirmed or named:
+    - If target box is a PET (or named PET): removes any unassigned face boxes inside the pet.
+    - If target box is a face named PET: removes any unassigned PET box enclosing it.
+    - Removes any unassigned duplicate box with >= 70% IoU.
+    """
+    try:
+        main_box = get_box_by_id(target_box_id)
+        if not main_box:
+            return
+
+        all_boxes = get_boxes_for_photo(photo_id)
+        for other in all_boxes:
+            if other["id"] == target_box_id:
+                continue
+            # Only clean up unassigned boxes
+            if other.get("entity_id") is not None and other.get("status") == "CONFIRMED":
+                continue
+
+            # Check if other is nested inside main_box
+            cx = (other["x_min"] + other["x_max"]) / 2
+            cy = (other["y_min"] + other["y_max"]) / 2
+            is_inside_main = (
+                (main_box["x_min"] - 0.03) <= cx <= (main_box["x_max"] + 0.03) and
+                (main_box["y_min"] - 0.03) <= cy <= (main_box["y_max"] + 0.03)
+            )
+
+            # Check if main_box is inside other
+            mcx = (main_box["x_min"] + main_box["x_max"]) / 2
+            mcy = (main_box["y_min"] + main_box["y_max"]) / 2
+            is_main_inside_other = (
+                (other["x_min"] - 0.03) <= mcx <= (other["x_max"] + 0.03) and
+                (other["y_min"] - 0.03) <= mcy <= (other["y_max"] + 0.03)
+            )
+
+            # Check IoU
+            xA = max(main_box["x_min"], other["x_min"])
+            yA = max(main_box["y_min"], other["y_min"])
+            xB = min(main_box["x_max"], other["x_max"])
+            yB = min(main_box["y_max"], other["y_max"])
+            inter = max(0.0, xB - xA) * max(0.0, yB - yA)
+            area1 = (main_box["x_max"] - main_box["x_min"]) * (main_box["y_max"] - main_box["y_min"])
+            area2 = (other["x_max"] - other["x_min"]) * (other["y_max"] - other["y_min"])
+            denom = area1 + area2 - inter
+            iou = inter / denom if denom > 0 else 0.0
+
+            should_delete = False
+            # Case 1: Main box is PET (or entity is PET) and other is unassigned face inside it
+            if (main_box.get("box_type") == "PET" or main_box.get("entity_type") == "PET") and is_inside_main:
+                should_delete = True
+            # Case 2: Main box is named face and other is unassigned PET box enclosing it
+            elif (main_box.get("entity_type") == "PET" or main_box.get("entity_id")) and is_main_inside_other and other.get("box_type") == "PET":
+                should_delete = True
+            # Case 3: Duplicate detection with high overlap
+            elif iou >= 0.70:
+                should_delete = True
+
+            if should_delete:
+                delete_box(other["id"])
+                crop_path = os.path.join(CROPS_CACHE_DIR, f"{other['id']}.jpg")
+                if os.path.exists(crop_path):
+                    try:
+                        os.remove(crop_path)
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"Error in cleanup_redundant_boxes: {e}")
+
 @app.post("/api/people-pets/boxes/{box_id}/confirm")
 def confirm_box_endpoint(box_id: int, entity_id: Optional[int] = Query(None)):
     """Confirms an auto-tagged box suggestion."""
@@ -1208,6 +1520,9 @@ def confirm_box_endpoint(box_id: int, entity_id: Optional[int] = Query(None)):
     entity = get_entity_by_id(target_eid)
     if entity and not entity.get("avatar_box_id"):
         update_entity(target_eid, avatar_box_id=box_id)
+
+    # Clean up redundant unassigned boxes (e.g. unassigned face inside a named pet)
+    cleanup_redundant_boxes(box["photo_id"], box_id)
 
     return {"message": "Box confirmed successfully", "box_id": box_id, "entity_id": target_eid}
 
@@ -1388,6 +1703,8 @@ def update_photo_box(photo_id: int, box_id: int, req: UpdateBoxRequest):
         entity = get_entity_by_id(entity_id)
         if entity and not entity.get("avatar_box_id"):
             update_entity(entity_id, avatar_box_id=box_id)
+        # Clean up redundant unassigned boxes (e.g. unassigned face inside a named pet)
+        cleanup_redundant_boxes(photo_id, box_id)
 
     # Re-extract crop and embedding if dimensions changed or newly assigned
     if dimensions_changed:

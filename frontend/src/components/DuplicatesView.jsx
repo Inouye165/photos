@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Copy,
   Star,
@@ -12,7 +12,13 @@ import {
   CheckCheck,
   ShieldCheck,
   ArchiveRestore,
-  Maximize2
+  Maximize2,
+  Calendar,
+  ArrowUpDown,
+  Flame,
+  Clock,
+  Layers,
+  Camera
 } from 'lucide-react';
 import GroupCompareModal from './GroupCompareModal';
 import {
@@ -25,6 +31,8 @@ import {
 
 export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
   const [duplicateGroups, setDuplicateGroups] = useState([]);
+  const [categoryFilter, setCategoryFilter] = useState('all'); // 'all' | 'exact' | 'burst' | 'similar'
+  const [sortOption, setSortOption] = useState('duplicates_desc');
   const [visibleCount, setVisibleCount] = useState(20);
   const [loading, setLoading] = useState(true);
   const [actionInProgress, setActionInProgress] = useState(false);
@@ -54,8 +62,114 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
     return mb >= 1 ? `${mb.toFixed(2)} MB` : `${Math.round(bytes / 1024)} KB`;
   };
 
+  const parseGroupDate = (group) => {
+    const dt = group.date_taken || group.primary?.date_taken || group.duplicates?.[0]?.date_taken;
+    if (dt) {
+      const cleaned = String(dt).replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3');
+      const parsed = new Date(cleaned);
+      if (!isNaN(parsed.getTime())) return parsed;
+    }
+    const mtime = group.file_modified_at || group.primary?.file_modified_at || group.duplicates?.[0]?.file_modified_at;
+    if (mtime) return new Date(mtime * 1000);
+    return null;
+  };
+
+  const formatDate = (dateVal) => {
+    if (!dateVal) return null;
+    const cleaned = String(dateVal).replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3');
+    const d = new Date(cleaned);
+    if (isNaN(d.getTime())) return String(dateVal);
+    return d.toLocaleDateString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    });
+  };
+
+  const formatDateTime = (dateVal) => {
+    if (!dateVal) return null;
+    const cleaned = String(dateVal).replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3');
+    const d = new Date(cleaned);
+    if (isNaN(d.getTime())) return String(dateVal);
+    return d.toLocaleDateString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+
   const totalWastedBytes = duplicateGroups.reduce((acc, g) => acc + (g.total_wasted_bytes || 0), 0);
   const totalDupCopies = duplicateGroups.reduce((acc, g) => acc + (g.duplicates?.length || 0), 0);
+
+  // Group counts per category
+  const counts = useMemo(() => {
+    let exact = 0;
+    let burst = 0;
+    let similar = 0;
+    duplicateGroups.forEach((g) => {
+      if (g.match_type === 'EXACT_HASH') exact++;
+      else if (g.match_type === 'BURST_SEQUENCE') burst++;
+      else similar++;
+    });
+    return { all: duplicateGroups.length, exact, burst, similar };
+  }, [duplicateGroups]);
+
+  // Filter groups by active category
+  const filteredGroups = useMemo(() => {
+    if (categoryFilter === 'exact') {
+      return duplicateGroups.filter((g) => g.match_type === 'EXACT_HASH');
+    }
+    if (categoryFilter === 'burst') {
+      return duplicateGroups.filter((g) => g.match_type === 'BURST_SEQUENCE');
+    }
+    if (categoryFilter === 'similar') {
+      return duplicateGroups.filter((g) => g.match_type === 'PERCEPTUAL_PHASH' || (g.match_type !== 'EXACT_HASH' && g.match_type !== 'BURST_SEQUENCE'));
+    }
+    return duplicateGroups;
+  }, [duplicateGroups, categoryFilter]);
+
+  // Sorted duplicate groups based on current sortOption
+  const sortedDuplicateGroups = useMemo(() => {
+    const groups = [...filteredGroups];
+    groups.sort((a, b) => {
+      if (sortOption === 'duplicates_desc') {
+        const diff = (b.duplicates?.length || 0) - (a.duplicates?.length || 0);
+        if (diff !== 0) return diff;
+        return (b.total_wasted_bytes || 0) - (a.total_wasted_bytes || 0);
+      }
+      if (sortOption === 'duplicates_asc') {
+        const diff = (a.duplicates?.length || 0) - (b.duplicates?.length || 0);
+        if (diff !== 0) return diff;
+        return (a.total_wasted_bytes || 0) - (b.total_wasted_bytes || 0);
+      }
+      if (sortOption === 'date_asc') {
+        const da = parseGroupDate(a);
+        const db = parseGroupDate(b);
+        if (!da && !db) return 0;
+        if (!da) return 1;
+        if (!db) return -1;
+        return da.getTime() - db.getTime();
+      }
+      if (sortOption === 'date_desc') {
+        const da = parseGroupDate(a);
+        const db = parseGroupDate(b);
+        if (!da && !db) return 0;
+        if (!da) return 1;
+        if (!db) return -1;
+        return db.getTime() - da.getTime();
+      }
+      if (sortOption === 'size_desc') {
+        return (b.total_wasted_bytes || 0) - (a.total_wasted_bytes || 0);
+      }
+      if (sortOption === 'size_asc') {
+        return (a.total_wasted_bytes || 0) - (b.total_wasted_bytes || 0);
+      }
+      return 0;
+    });
+    return groups;
+  }, [filteredGroups, sortOption]);
 
   // Single copy trash click
   const handleSingleTrashClick = (e, photo, group) => {
@@ -187,6 +301,259 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
         </div>
       </div>
 
+      {/* Category Tabs: All, Exact Clones, Continuous Bursts, Visually Similar */}
+      {duplicateGroups.length > 0 && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '10px',
+          flexWrap: 'wrap',
+          marginBottom: '1rem'
+        }}>
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => setCategoryFilter('all')}
+            style={{
+              fontSize: '0.82rem',
+              fontWeight: 600,
+              padding: '0.45rem 0.9rem',
+              borderRadius: '10px',
+              background: categoryFilter === 'all' ? 'rgba(255, 255, 255, 0.12)' : 'rgba(255, 255, 255, 0.03)',
+              borderColor: categoryFilter === 'all' ? 'rgba(255, 255, 255, 0.3)' : 'rgba(255, 255, 255, 0.08)',
+              color: categoryFilter === 'all' ? '#ffffff' : '#94a3b8',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px'
+            }}
+          >
+            <span>All Categories</span>
+            <span style={{
+              fontSize: '0.72rem',
+              padding: '2px 7px',
+              borderRadius: '9999px',
+              background: categoryFilter === 'all' ? 'rgba(255, 255, 255, 0.2)' : 'rgba(255, 255, 255, 0.06)',
+              color: '#f8fafc'
+            }}>{counts.all}</span>
+          </button>
+
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => setCategoryFilter('exact')}
+            style={{
+              fontSize: '0.82rem',
+              fontWeight: 600,
+              padding: '0.45rem 0.9rem',
+              borderRadius: '10px',
+              background: categoryFilter === 'exact' ? 'rgba(245, 158, 11, 0.22)' : 'rgba(255, 255, 255, 0.03)',
+              borderColor: categoryFilter === 'exact' ? 'rgba(245, 158, 11, 0.5)' : 'rgba(255, 255, 255, 0.08)',
+              color: categoryFilter === 'exact' ? '#fde68a' : '#cbd5e1',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px'
+            }}
+            title="100% bit-for-bit identical SHA-256 duplicate files"
+          >
+            <Copy size={14} color="#f59e0b" />
+            <span>Exact Clones</span>
+            <span style={{
+              fontSize: '0.72rem',
+              padding: '2px 7px',
+              borderRadius: '9999px',
+              background: 'rgba(245, 158, 11, 0.2)',
+              color: '#fde68a'
+            }}>{counts.exact}</span>
+          </button>
+
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => setCategoryFilter('burst')}
+            style={{
+              fontSize: '0.82rem',
+              fontWeight: 600,
+              padding: '0.45rem 0.9rem',
+              borderRadius: '10px',
+              background: categoryFilter === 'burst' ? 'rgba(6, 182, 212, 0.22)' : 'rgba(255, 255, 255, 0.03)',
+              borderColor: categoryFilter === 'burst' ? 'rgba(6, 182, 212, 0.5)' : 'rgba(255, 255, 255, 0.08)',
+              color: categoryFilter === 'burst' ? '#67e8f9' : '#cbd5e1',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px'
+            }}
+            title="Photos taken within 1 minute with tight composition similarity (Google-style Photo Stacks)"
+          >
+            <Layers size={14} color="#06b6d4" />
+            <span>Continuous Bursts</span>
+            <span style={{
+              fontSize: '0.72rem',
+              padding: '2px 7px',
+              borderRadius: '9999px',
+              background: 'rgba(6, 182, 212, 0.2)',
+              color: '#67e8f9'
+            }}>{counts.burst}</span>
+          </button>
+
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => setCategoryFilter('similar')}
+            style={{
+              fontSize: '0.82rem',
+              fontWeight: 600,
+              padding: '0.45rem 0.9rem',
+              borderRadius: '10px',
+              background: categoryFilter === 'similar' ? 'rgba(99, 102, 241, 0.22)' : 'rgba(255, 255, 255, 0.03)',
+              borderColor: categoryFilter === 'similar' ? 'rgba(99, 102, 241, 0.5)' : 'rgba(255, 255, 255, 0.08)',
+              color: categoryFilter === 'similar' ? '#c7d2fe' : '#cbd5e1',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px'
+            }}
+            title="Visually similar photos taken at different times or with looser similarity"
+          >
+            <Sparkles size={14} color="#818cf8" />
+            <span>Visually Similar</span>
+            <span style={{
+              fontSize: '0.72rem',
+              padding: '2px 7px',
+              borderRadius: '9999px',
+              background: 'rgba(99, 102, 241, 0.2)',
+              color: '#c7d2fe'
+            }}>{counts.similar}</span>
+          </button>
+        </div>
+      )}
+
+      {/* Sorting & Filter Controls Toolbar */}
+      {duplicateGroups.length > 0 && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: '12px',
+            background: 'rgba(255, 255, 255, 0.03)',
+            border: '1px solid rgba(255, 255, 255, 0.08)',
+            padding: '0.75rem 1.25rem',
+            borderRadius: '12px',
+            marginBottom: '1.25rem',
+            backdropFilter: 'blur(12px)'
+          }}
+        >
+          {/* Quick preset sort chips */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '0.8rem', color: '#94a3b8', fontWeight: 500, marginRight: '4px' }}>
+              Quick Sort:
+            </span>
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => setSortOption('duplicates_desc')}
+              style={{
+                fontSize: '0.78rem',
+                padding: '0.35rem 0.75rem',
+                borderRadius: '9999px',
+                background: sortOption === 'duplicates_desc' ? 'rgba(245, 158, 11, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+                borderColor: sortOption === 'duplicates_desc' ? 'rgba(245, 158, 11, 0.5)' : 'rgba(255, 255, 255, 0.1)',
+                color: sortOption === 'duplicates_desc' ? '#fde68a' : '#cbd5e1',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '5px'
+              }}
+              title="Sort by clusters with the highest number of photos"
+            >
+              <Flame size={13} color={sortOption === 'duplicates_desc' ? '#f59e0b' : '#94a3b8'} />
+              <span>Most Takes / Copies</span>
+            </button>
+
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => setSortOption('date_asc')}
+              style={{
+                fontSize: '0.78rem',
+                padding: '0.35rem 0.75rem',
+                borderRadius: '9999px',
+                background: sortOption === 'date_asc' ? 'rgba(56, 189, 248, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+                borderColor: sortOption === 'date_asc' ? 'rgba(56, 189, 248, 0.5)' : 'rgba(255, 255, 255, 0.1)',
+                color: sortOption === 'date_asc' ? '#7dd3fc' : '#cbd5e1',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '5px'
+              }}
+              title="Compare older photos and historical duplicate clusters first"
+            >
+              <Clock size={13} color={sortOption === 'date_asc' ? '#38bdf8' : '#94a3b8'} />
+              <span>Oldest First (By Age)</span>
+            </button>
+
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => setSortOption('date_desc')}
+              style={{
+                fontSize: '0.78rem',
+                padding: '0.35rem 0.75rem',
+                borderRadius: '9999px',
+                background: sortOption === 'date_desc' ? 'rgba(129, 140, 248, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+                borderColor: sortOption === 'date_desc' ? 'rgba(129, 140, 248, 0.5)' : 'rgba(255, 255, 255, 0.1)',
+                color: sortOption === 'date_desc' ? '#c7d2fe' : '#cbd5e1',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '5px'
+              }}
+              title="Compare newer and most recent duplicate clusters first"
+            >
+              <Sparkles size={13} color={sortOption === 'date_desc' ? '#a5b4fc' : '#94a3b8'} />
+              <span>Newest First (By Age)</span>
+            </button>
+
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => setSortOption('size_desc')}
+              style={{
+                fontSize: '0.78rem',
+                padding: '0.35rem 0.75rem',
+                borderRadius: '9999px',
+                background: sortOption === 'size_desc' ? 'rgba(239, 68, 68, 0.18)' : 'rgba(255, 255, 255, 0.05)',
+                borderColor: sortOption === 'size_desc' ? 'rgba(239, 68, 68, 0.45)' : 'rgba(255, 255, 255, 0.1)',
+                color: sortOption === 'size_desc' ? '#fca5a5' : '#cbd5e1',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '5px'
+              }}
+              title="Sort by largest disk space savings"
+            >
+              <HardDrive size={13} color={sortOption === 'size_desc' ? '#ef4444' : '#94a3b8'} />
+              <span>Largest Redundant Size</span>
+            </button>
+          </div>
+
+          {/* Full sort dropdown */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <ArrowUpDown size={14} style={{ color: '#94a3b8' }} />
+            <span style={{ fontSize: '0.8rem', color: '#94a3b8' }}>Sort duplicates:</span>
+            <select
+              className="select-styled"
+              value={sortOption}
+              onChange={(e) => setSortOption(e.target.value)}
+              style={{ minWidth: '210px' }}
+            >
+              <option value="duplicates_desc">Most Duplicates / Takes</option>
+              <option value="duplicates_asc">Fewest Duplicates / Takes</option>
+              <option value="date_asc">Oldest Photos First (By Age)</option>
+              <option value="date_desc">Newest Photos First (By Age)</option>
+              <option value="size_desc">Largest Redundant Space</option>
+              <option value="size_asc">Smallest Redundant Space</option>
+            </select>
+          </div>
+        </div>
+      )}
+
       {duplicateGroups.length === 0 ? (
         <div style={{
           textAlign: 'center',
@@ -205,36 +572,146 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
             All scanned photos in your library are unique.
           </p>
         </div>
+      ) : sortedDuplicateGroups.length === 0 ? (
+        <div style={{
+          textAlign: 'center',
+          padding: '4rem 2rem',
+          background: 'rgba(255, 255, 255, 0.02)',
+          borderRadius: '16px',
+          border: '1px dashed rgba(255, 255, 255, 0.1)',
+          maxWidth: '600px',
+          margin: '2rem auto'
+        }}>
+          <Layers size={44} color="#67e8f9" style={{ marginBottom: '1rem' }} />
+          <h3 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.2rem', marginBottom: '0.5rem', color: '#f1f5f9' }}>
+            No Photos in this Category
+          </h3>
+          <p style={{ color: '#94a3b8', fontSize: '0.85rem', marginBottom: '1.25rem' }}>
+            There are currently no clusters matching the "{categoryFilter}" filter.
+          </p>
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => setCategoryFilter('all')}
+            style={{ fontSize: '0.85rem', padding: '0.4rem 1rem' }}
+          >
+            View All Categories ({counts.all})
+          </button>
+        </div>
       ) : (
         <>
-          {duplicateGroups.slice(0, visibleCount).map((group, index) => {
+          {sortedDuplicateGroups.slice(0, visibleCount).map((group, index) => {
           const primary = group.primary;
           const dups = group.duplicates || [];
-          const matchLabel = group.match_type === 'EXACT_HASH' ? 'Exact SHA-256 Match' : 'Perceptual Visual Match';
+          const isExact = group.match_type === 'EXACT_HASH';
+          const isBurst = group.match_type === 'BURST_SEQUENCE';
+          const matchLabel = isExact 
+            ? 'Exact SHA-256 Match' 
+            : isBurst 
+            ? 'Continuous Burst' 
+            : 'Visually Similar Match';
+          const groupDate = parseGroupDate(group);
+          const groupDateFormatted = formatDate(groupDate);
 
           return (
             <div key={group.group_id} className="dup-group-card">
               <div className="dup-group-header">
-                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
                   <span style={{
                     fontSize: '0.75rem',
                     fontWeight: 700,
                     padding: '3px 9px',
                     borderRadius: '9999px',
-                    background: group.match_type === 'EXACT_HASH' ? 'rgba(245, 158, 11, 0.2)' : 'rgba(99, 102, 241, 0.2)',
-                    color: group.match_type === 'EXACT_HASH' ? '#fde68a' : '#c7d2fe',
-                    border: '1px solid rgba(255, 255, 255, 0.1)'
+                    background: isExact 
+                      ? 'rgba(245, 158, 11, 0.2)' 
+                      : isBurst 
+                      ? 'rgba(6, 182, 212, 0.2)' 
+                      : 'rgba(99, 102, 241, 0.2)',
+                    color: isExact 
+                      ? '#fde68a' 
+                      : isBurst 
+                      ? '#67e8f9' 
+                      : '#c7d2fe',
+                    border: isExact 
+                      ? '1px solid rgba(245, 158, 11, 0.4)' 
+                      : isBurst 
+                      ? '1px solid rgba(6, 182, 212, 0.4)' 
+                      : '1px solid rgba(99, 102, 241, 0.4)',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px'
                   }}>
-                    {matchLabel}
+                    {isBurst ? <Layers size={11} /> : isExact ? <Copy size={11} /> : <Sparkles size={11} />}
+                    <span>{matchLabel}</span>
                   </span>
                   <span style={{ fontSize: '0.85rem', color: '#cbd5e1', fontWeight: 600 }}>
-                    Group #{index + 1} ({group.total_items} copies)
+                    Group #{index + 1}
                   </span>
+
+                  {/* Prominent count badge */}
+                  <span style={{
+                    fontSize: '0.75rem',
+                    fontWeight: 600,
+                    padding: '3px 8px',
+                    borderRadius: '9999px',
+                    background: isBurst 
+                      ? 'rgba(6, 182, 212, 0.15)' 
+                      : isExact 
+                      ? 'rgba(245, 158, 11, 0.15)' 
+                      : 'rgba(99, 102, 241, 0.15)',
+                    color: isBurst 
+                      ? '#67e8f9' 
+                      : isExact 
+                      ? '#fde68a' 
+                      : '#c7d2fe',
+                    border: isBurst 
+                      ? '1px solid rgba(6, 182, 212, 0.3)' 
+                      : isExact 
+                      ? '1px solid rgba(245, 158, 11, 0.3)' 
+                      : '1px solid rgba(99, 102, 241, 0.3)',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px'
+                  }}>
+                    {isBurst ? <Camera size={11} /> : <Copy size={11} />}
+                    <span>
+                      {isBurst 
+                        ? `${dups.length} alternative take${dups.length === 1 ? '' : 's'}` 
+                        : isExact 
+                        ? `${dups.length} duplicate${dups.length === 1 ? '' : 's'} to remove` 
+                        : `${dups.length} similar photo${dups.length === 1 ? '' : 's'}`}
+                    </span>
+                  </span>
+
+                  {/* Prominent age / date badge */}
+                  {groupDateFormatted && (
+                    <span style={{
+                      fontSize: '0.75rem',
+                      fontWeight: 500,
+                      padding: '3px 8px',
+                      borderRadius: '9999px',
+                      background: 'rgba(56, 189, 248, 0.12)',
+                      color: '#7dd3fc',
+                      border: '1px solid rgba(56, 189, 248, 0.25)',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px'
+                    }}
+                    title={`Date taken: ${groupDateFormatted}`}
+                    >
+                      <Calendar size={11} />
+                      <span>{groupDateFormatted}</span>
+                    </span>
+                  )}
                 </div>
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                  <span style={{ fontSize: '0.8rem', color: '#f87171', fontWeight: 500 }}>
-                    Wasted: {formatFileSize(group.total_wasted_bytes)}
+                  <span style={{
+                    fontSize: '0.8rem',
+                    color: isExact ? '#f87171' : isBurst ? '#94a3b8' : '#cbd5e1',
+                    fontWeight: 500
+                  }}>
+                    {isBurst ? 'Savings: ' : 'Wasted: '}{formatFileSize(group.total_wasted_bytes)}
                   </span>
                   
                   {/* Compare Group Studio Action */}
@@ -244,9 +721,9 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
                     style={{
                       fontSize: '0.75rem',
                       padding: '0.3rem 0.75rem',
-                      background: 'rgba(56, 189, 248, 0.14)',
-                      borderColor: 'rgba(56, 189, 248, 0.4)',
-                      color: '#7dd3fc',
+                      background: isBurst ? 'rgba(6, 182, 212, 0.15)' : 'rgba(56, 189, 248, 0.14)',
+                      borderColor: isBurst ? 'rgba(6, 182, 212, 0.4)' : 'rgba(56, 189, 248, 0.4)',
+                      color: isBurst ? '#67e8f9' : '#7dd3fc',
                       display: 'inline-flex',
                       alignItems: 'center',
                       gap: '5px'
@@ -256,10 +733,10 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
                       setCompareGroup(group);
                       setCompareGroupIndex(index);
                     }}
-                    title="Open full-screen shootout studio to compare, filter, and pick winners"
+                    title={isBurst ? "Open full-screen shootout studio to review burst takes and pick your favorites" : "Open full-screen shootout studio to compare, filter, and pick winners"}
                   >
                     <Maximize2 size={13} />
-                    <span>Compare Group ({group.total_items})</span>
+                    <span>{isBurst ? `Compare Burst (${group.total_items})` : `Compare Group (${group.total_items})`}</span>
                   </button>
 
                   {/* Group Trash Action */}
@@ -270,16 +747,16 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
                       style={{
                         fontSize: '0.75rem',
                         padding: '0.3rem 0.75rem',
-                        background: 'rgba(239, 68, 68, 0.15)',
+                        background: isBurst ? 'rgba(239, 68, 68, 0.12)' : 'rgba(239, 68, 68, 0.15)',
                         borderColor: 'rgba(239, 68, 68, 0.35)',
                         color: '#fca5a5'
                       }}
                       onClick={(e) => handleGroupTrashClick(e, group)}
                       disabled={actionInProgress}
-                      title="Move all duplicate copies in this group to Trash"
+                      title={isBurst ? "Keep the Top Pick and move unchosen burst takes to Trash" : "Move all duplicate copies in this group to Trash"}
                     >
                       <Trash2 size={13} />
-                      <span>Trash Duplicates ({dups.length})</span>
+                      <span>{isBurst ? `Keep Top Pick (Trash ${dups.length})` : `Trash Duplicates (${dups.length})`}</span>
                     </button>
                   )}
 
@@ -290,7 +767,7 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
                     style={{ fontSize: '0.75rem', padding: '0.3rem 0.75rem' }}
                     onClick={(e) => handleDismissGroup(e, group.group_id)}
                     disabled={dismissingGroupId === group.group_id || actionInProgress}
-                    title="Keep all files and unmark as duplicate"
+                    title="Keep all files and unmark from duplicates/bursts"
                   >
                     <CheckCheck size={13} color="#10b981" />
                     <span>Keep All</span>
@@ -299,16 +776,20 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
               </div>
 
               <div className="dup-items-row">
-                {/* Primary Keeper */}
+                {/* Primary Keeper / Top Pick */}
                 {primary && (
                   <div
                     className="dup-item-card is-primary"
                     onClick={() => onSelectPhoto(primary)}
                     style={{ cursor: 'pointer' }}
                   >
-                    <div className="primary-badge">
-                      <Star size={10} fill="#ffffff" style={{ display: 'inline', marginRight: '3px' }} />
-                      Primary Keeper
+                    <div className="primary-badge" style={isBurst ? {
+                      background: 'linear-gradient(135deg, #059669 0%, #0d9488 100%)',
+                      color: '#ffffff',
+                      border: '1px solid rgba(52, 211, 153, 0.4)'
+                    } : {}}>
+                      <Star size={10} fill={isBurst ? "#fef08a" : "#ffffff"} color={isBurst ? "#fef08a" : "#ffffff"} style={{ display: 'inline', marginRight: '4px' }} />
+                      {isBurst ? 'Top Pick' : 'Primary Keeper'}
                     </div>
                     <img
                       src={`/api/photos/${primary.id}/thumbnail`}
@@ -323,12 +804,18 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
                       <div style={{ fontSize: '0.75rem', color: '#34d399', margin: '3px 0' }}>
                         {primary.width}×{primary.height} px • {formatFileSize(primary.file_size)}
                       </div>
+                      {primary.date_taken && (
+                        <div style={{ fontSize: '0.72rem', color: '#94a3b8', margin: '2px 0', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                          <Calendar size={11} color="#64748b" />
+                          <span>{formatDateTime(primary.date_taken)}</span>
+                        </div>
+                      )}
                       <div style={{ fontSize: '0.7rem', color: '#64748b', wordBreak: 'break-all' }}>
                         {primary.file_path}
                       </div>
                       <div style={{ marginTop: '6px', fontSize: '0.72rem', color: '#a7f3d0', display: 'flex', alignItems: 'center', gap: '4px' }}>
                         <ShieldCheck size={13} color="#34d399" />
-                        <span>Preserved in Main Library</span>
+                        <span>{isBurst ? 'Top Pick • Preserved in Main Library' : 'Preserved in Main Library'}</span>
                       </div>
                     </div>
                   </div>
@@ -355,6 +842,12 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
                       <div style={{ fontSize: '0.75rem', color: '#94a3b8', margin: '3px 0' }}>
                         {dup.width}×{dup.height} px • {formatFileSize(dup.file_size)}
                       </div>
+                      {dup.date_taken && (
+                        <div style={{ fontSize: '0.72rem', color: '#94a3b8', margin: '2px 0', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                          <Calendar size={11} color="#64748b" />
+                          <span>{formatDateTime(dup.date_taken)}</span>
+                        </div>
+                      )}
                       <div style={{ fontSize: '0.7rem', color: '#64748b', wordBreak: 'break-all' }}>
                         {dup.file_path}
                       </div>
@@ -386,7 +879,7 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
             );
           })}
 
-          {visibleCount < duplicateGroups.length && (
+          {visibleCount < sortedDuplicateGroups.length && (
             <div style={{ textAlign: 'center', margin: '2rem 0' }}>
               <button
                 type="button"
@@ -394,7 +887,7 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
                 style={{ padding: '0.6rem 1.5rem', fontSize: '0.875rem' }}
                 onClick={() => setVisibleCount((prev) => prev + 20)}
               >
-                Show More Duplicate Groups ({duplicateGroups.length - visibleCount} remaining)
+                Show More Duplicate Groups ({sortedDuplicateGroups.length - visibleCount} remaining)
               </button>
             </div>
           )}
@@ -541,6 +1034,13 @@ export default function DuplicatesView({ onSelectPhoto, onLibraryUpdated }) {
         <GroupCompareModal
           group={compareGroup}
           groupIndex={compareGroupIndex}
+          groups={sortedDuplicateGroups}
+          onNavigateGroup={(nextIdx) => {
+            if (nextIdx >= 0 && nextIdx < sortedDuplicateGroups.length) {
+              setCompareGroup(sortedDuplicateGroups[nextIdx]);
+              setCompareGroupIndex(nextIdx);
+            }
+          }}
           onClose={() => setCompareGroup(null)}
           onApplied={() => {
             loadData();

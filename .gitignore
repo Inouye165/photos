@@ -15,6 +15,12 @@ venv/
 .venv/
 env/
 .pytest_cache/
+credentials.json
+token.json
+.oauth_verifier.json
+backend/credentials.json
+backend/token.json
+backend/.oauth_verifier.json
 
 # Model weights
 *.pt

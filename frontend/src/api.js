@@ -44,8 +44,12 @@ export async function fetchPhotoDetails(photoId) {
   return res.json();
 }
 
-export async function fetchDuplicates() {
-  const res = await fetch(`${API_BASE}/duplicates`);
+export async function fetchDuplicates({ sortBy = null, sortOrder = null } = {}) {
+  const params = new URLSearchParams();
+  if (sortBy) params.append('sort_by', sortBy);
+  if (sortOrder) params.append('sort_order', sortOrder);
+  const queryStr = params.toString() ? `?${params.toString()}` : '';
+  const res = await fetch(`${API_BASE}/duplicates${queryStr}`);
   if (!res.ok) throw new Error('Failed to fetch duplicates');
   return res.json();
 }
@@ -402,6 +406,77 @@ export async function unlinkBox(boxId) {
     method: 'POST'
   });
   if (!res.ok) throw new Error('Failed to unlink box');
+  return res.json();
+}
+
+export async function fetchBackupStatus() {
+  const res = await fetch(`${API_BASE}/backup/status`);
+  if (!res.ok) throw new Error('Failed to fetch backup status');
+  return res.json();
+}
+
+export async function fetchBackupAuthUrl() {
+  const res = await fetch(`${API_BASE}/backup/auth/url`);
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || 'Failed to get authorization URL');
+  }
+  return res.json();
+}
+
+export async function exchangeBackupCode(code) {
+  const res = await fetch(`${API_BASE}/backup/auth/exchange`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code })
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || 'Failed to exchange code');
+  }
+  return res.json();
+}
+
+export async function startBackupAuth() {
+  const res = await fetch(`${API_BASE}/backup/auth/start`, { method: 'POST' });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || 'Failed to start Google Drive authentication');
+  }
+  return res.json();
+}
+
+export async function disconnectBackup() {
+  const res = await fetch(`${API_BASE}/backup/auth/disconnect`, { method: 'POST' });
+  if (!res.ok) throw new Error('Failed to disconnect Google Drive');
+  return res.json();
+}
+
+export async function pauseBackup() {
+  const res = await fetch(`${API_BASE}/backup/pause`, { method: 'POST' });
+  if (!res.ok) throw new Error('Failed to pause backup');
+  return res.json();
+}
+
+export async function resumeBackup() {
+  const res = await fetch(`${API_BASE}/backup/resume`, { method: 'POST' });
+  if (!res.ok) throw new Error('Failed to resume backup');
+  return res.json();
+}
+
+export async function updateBackupSettings(settings) {
+  const res = await fetch(`${API_BASE}/backup/settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings)
+  });
+  if (!res.ok) throw new Error('Failed to update backup settings');
+  return res.json();
+}
+
+export async function retryFailedBackups() {
+  const res = await fetch(`${API_BASE}/backup/retry-failed`, { method: 'POST' });
+  if (!res.ok) throw new Error('Failed to retry backups');
   return res.json();
 }
 

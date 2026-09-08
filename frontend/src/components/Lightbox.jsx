@@ -17,7 +17,10 @@ import {
   User,
   Heart,
   Sparkles,
-  Plus
+  Plus,
+  Cloud,
+  CloudCheck,
+  CloudUpload
 } from 'lucide-react';
 import { fetchPhotoDetails, reclassifyPhoto, deletePhoto, tagPhotoTrash } from '../api';
 import BoundingBoxOverlay from './BoundingBoxOverlay';
@@ -31,6 +34,7 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
   const [showBoxes, setShowBoxes] = useState(true);
   const [photoBoxes, setPhotoBoxes] = useState([]);
   const [isDrawMode, setIsDrawMode] = useState(false);
+  const [selectedBoxId, setSelectedBoxId] = useState(null);
 
   const handleBoxesUpdated = useCallback((boxes) => {
     if (Array.isArray(boxes)) {
@@ -271,6 +275,8 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
               onBoxesUpdated={handleBoxesUpdated}
               isDrawMode={isDrawMode}
               setIsDrawMode={setIsDrawMode}
+              selectedBoxId={selectedBoxId}
+              onSelectBox={setSelectedBoxId}
             />
           )}
         </div>
@@ -306,14 +312,17 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
               {photoBoxes.map((box) => (
                 <div
                   key={box.id}
+                  onClick={() => setSelectedBoxId(box.id)}
                   style={{
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'space-between',
                     padding: '6px 8px',
                     borderRadius: '6px',
-                    background: 'rgba(255, 255, 255, 0.04)',
-                    border: '1px solid rgba(255, 255, 255, 0.08)'
+                    background: selectedBoxId === box.id ? 'rgba(99, 102, 241, 0.25)' : 'rgba(255, 255, 255, 0.04)',
+                    border: selectedBoxId === box.id ? '1px solid #6366f1' : '1px solid rgba(255, 255, 255, 0.08)',
+                    cursor: 'pointer',
+                    transition: 'all 0.15s ease'
                   }}
                 >
                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -452,6 +461,50 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
             <div className="exif-row">
               <span className="exif-label">GPS Geotag</span>
               <span className="exif-value" style={{ color: '#64748b' }}>None</span>
+            </div>
+          )}
+        </div>
+
+        {/* Google Drive Backup Status */}
+        <div className="exif-block">
+          <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#94a3b8', marginBottom: '0.5rem', textTransform: 'uppercase', letterSpacing: '0.05em', display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <Cloud size={13} color="#38bdf8" />
+            <span>Google Drive Backup</span>
+          </div>
+          <div className="exif-row">
+            <span className="exif-label">Backup Status</span>
+            <span
+              className="exif-value"
+              style={{
+                color: details.gdrive_backup_status === 'backed_up'
+                  ? '#34d399'
+                  : details.gdrive_backup_status === 'uploading'
+                  ? '#38bdf8'
+                  : '#94a3b8',
+                fontWeight: 600
+              }}
+            >
+              {details.gdrive_backup_status === 'backed_up'
+                ? '✓ Backed Up'
+                : details.gdrive_backup_status === 'uploading'
+                ? 'Uploading...'
+                : 'Pending'}
+            </span>
+          </div>
+          {details.gdrive_backed_up_at && (
+            <div className="exif-row">
+              <span className="exif-label">Backed Up At</span>
+              <span className="exif-value">
+                {new Date(details.gdrive_backed_up_at * 1000).toLocaleString()}
+              </span>
+            </div>
+          )}
+          {details.gdrive_error && (
+            <div className="exif-row">
+              <span className="exif-label" style={{ color: '#f87171' }}>Last Error</span>
+              <span className="exif-value" style={{ color: '#fca5a5' }}>
+                {details.gdrive_error}
+              </span>
             </div>
           )}
         </div>

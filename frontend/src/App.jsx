@@ -180,6 +180,16 @@ export default function App() {
     loadPhotos({ isLoadMore: false });
   }, [debouncedQuery, selectedYear, selectedEntity, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder]);
 
+  // When switching back to the 'photos' tab from Duplicates, Trash, or other views, refresh photos & stats automatically
+  const prevTabRef = useRef(activeTab);
+  useEffect(() => {
+    if (prevTabRef.current !== 'photos' && activeTab === 'photos') {
+      loadStats();
+      loadPhotos({ isLoadMore: false });
+    }
+    prevTabRef.current = activeTab;
+  }, [activeTab, loadStats, loadPhotos]);
+
   const handleSearch = (searchQuery) => {
     setQuery(searchQuery);
     setDebouncedQuery(searchQuery);

@@ -6,10 +6,38 @@ Determines the optimal primary keeper based on resolution, metadata richness, an
 
 import uuid
 import sqlite3
+from datetime import datetime
 from collections import defaultdict, deque
 from typing import List, Dict, Any, Tuple, Optional, Set
 import imagehash
 from backend.database import get_connection, DB_PATH, get_dismissed_pairs_set
+
+def parse_photo_timestamp(date_str: Optional[str], mtime: Optional[float] = None) -> Optional[float]:
+    """Extracts unix epoch timestamp (seconds) from photo date_taken string or fallback file_modified_at."""
+    if date_str:
+        cleaned = str(date_str).strip().replace("\x00", "")
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y:%m:%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y:%m:%d",
+            "%Y-%m-%d"
+        ):
+            try:
+                return datetime.strptime(cleaned[:19], fmt).timestamp()
+            except Exception:
+                pass
+        try:
+            return datetime.fromisoformat(cleaned).timestamp()
+        except Exception:
+            pass
+    if mtime is not None:
+        try:
+            return float(mtime)
+        except Exception:
+            pass
+    return None
 
 def fast_hamming(int1: int, int2: int) -> int:
     """Computes bitwise Hamming distance between two pre-converted integer hashes in nanoseconds."""
@@ -144,7 +172,7 @@ def run_deduplication_pass(db_path: Optional[str] = None, force_recluster: bool 
 
     # Step 2: High-Speed Multi-Index Bucketing for pHash near-duplicates
     cursor.execute("""
-        SELECT id, file_path, file_size, width, height, classification, date_taken, camera_make, phash
+        SELECT id, file_path, file_size, width, height, classification, date_taken, file_modified_at, camera_make, phash
         FROM photos 
         WHERE phash IS NOT NULL 
           AND duplicate_group_id IS NULL 
@@ -196,7 +224,7 @@ def run_deduplication_pass(db_path: Optional[str] = None, force_recluster: bool 
                 adjacency[idx1].add(idx2)
                 adjacency[idx2].add(idx1)
 
-        # Graph connected components for mathematically consistent clustering
+        # Graph connected components for candidate clustering
         visited = set()
         for start_idx in adjacency:
             if start_idx in visited:
@@ -216,23 +244,89 @@ def run_deduplication_pass(db_path: Optional[str] = None, force_recluster: bool 
 
             if len(cluster_indices) > 1:
                 cluster_photos = [phash_candidates[ci][0] for ci in cluster_indices]
-                group_id = f"phash_{uuid.uuid4().hex[:12]}"
-                primary = select_best_primary(cluster_photos)
-                primary_id = primary["id"]
-                wasted_bytes = sum(m["file_size"] for m in cluster_photos if m["id"] != primary_id)
+                cluster_hashes = [phash_candidates[ci][1] for ci in cluster_indices]
 
-                cursor.execute("""
-                    INSERT INTO duplicate_groups (id, primary_photo_id, match_type, total_items, total_wasted_bytes, created_at)
-                    VALUES (?, ?, 'PERCEPTUAL_PHASH', ?, ?, strftime('%s', 'now'))
-                """, (group_id, primary_id, len(cluster_photos), wasted_bytes))
+                # Determine initial anchor / best primary
+                initial_primary = select_best_primary(cluster_photos)
+                initial_primary_id = initial_primary["id"]
+                initial_primary_hash = next(
+                    h for p, h in zip(cluster_photos, cluster_hashes) if p["id"] == initial_primary_id
+                )
 
-                for m in cluster_photos:
-                    is_p = 1 if m["id"] == primary_id else 0
+                # Extract unix timestamps for temporal window evaluation
+                timestamps = [
+                    parse_photo_timestamp(p.get("date_taken"), p.get("file_modified_at"))
+                    for p in cluster_photos
+                ]
+                valid_ts = [ts for ts in timestamps if ts is not None]
+
+                is_burst = False
+                final_cluster = cluster_photos
+
+                # Continuous Burst (Google-style Photo Stack) criteria:
+                # 1. At least 2 photos with timestamps.
+                # 2. Taken within <= 60 seconds of each other (or continuous burst interval <= 12s, max span <= 120s).
+                # 3. Anti-drift rule: every photo in the burst stack must have tight perceptual similarity
+                #    to the anchor photo (Hamming distance <= 5, ~92%+ match).
+                #    Photos that drifted away (camera panned away, different direction/angle, or sports play
+                #    progressing downfield) are excluded from the burst.
+                if len(valid_ts) >= 2:
+                    sorted_ts = sorted(valid_ts)
+                    time_span = sorted_ts[-1] - sorted_ts[0]
+                    max_consecutive_gap = max(
+                        (sorted_ts[i + 1] - sorted_ts[i] for i in range(len(sorted_ts) - 1)),
+                        default=0
+                    )
+                    is_within_time_window = (time_span <= 60.0) or (time_span <= 120.0 and max_consecutive_gap <= 12.0)
+
+                    if is_within_time_window:
+                        tight_burst_photos = []
+                        for p, h in zip(cluster_photos, cluster_hashes):
+                            dist_to_anchor = fast_hamming(h, initial_primary_hash)
+                            if dist_to_anchor <= 5:
+                                tight_burst_photos.append(p)
+
+                        if len(tight_burst_photos) > 1:
+                            is_burst = True
+                            final_cluster = tight_burst_photos
+
+                # Enforce dismissed pairs across all members of candidate cluster
+                allowed_cluster = []
+                for m in final_cluster:
+                    is_dismissed = False
+                    for other in allowed_cluster:
+                        pair = (min(m["id"], other["id"]), max(m["id"], other["id"]))
+                        if pair in dismissed_pairs:
+                            is_dismissed = True
+                            break
+                    if not is_dismissed:
+                        allowed_cluster.append(m)
+                final_cluster = allowed_cluster
+
+                if len(final_cluster) > 1:
+                    primary = select_best_primary(final_cluster)
+                    primary_id = primary["id"]
+                    wasted_bytes = sum(m["file_size"] for m in final_cluster if m["id"] != primary_id)
+
+                    if is_burst:
+                        match_type = 'BURST_SEQUENCE'
+                        group_id = f"burst_{uuid.uuid4().hex[:12]}"
+                    else:
+                        match_type = 'PERCEPTUAL_PHASH'
+                        group_id = f"phash_{uuid.uuid4().hex[:12]}"
+
                     cursor.execute("""
-                        UPDATE photos 
-                        SET duplicate_group_id = ?, is_primary = ?, duplicate_count = ?
-                        WHERE id = ?
-                    """, (group_id, is_p, len(cluster_photos) - 1, m["id"]))
+                        INSERT INTO duplicate_groups (id, primary_photo_id, match_type, total_items, total_wasted_bytes, created_at)
+                        VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+                    """, (group_id, primary_id, match_type, len(final_cluster), wasted_bytes))
+
+                    for m in final_cluster:
+                        is_p = 1 if m["id"] == primary_id else 0
+                        cursor.execute("""
+                            UPDATE photos 
+                            SET duplicate_group_id = ?, is_primary = ?, duplicate_count = ?
+                            WHERE id = ?
+                        """, (group_id, is_p, len(final_cluster) - 1, m["id"]))
 
     conn.commit()
 

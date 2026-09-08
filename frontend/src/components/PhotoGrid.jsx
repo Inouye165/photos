@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
-import { Camera, Calendar, Copy, Sparkles, Image as ImageIcon, MapPin, ArrowUp, Loader2, Trash2, RotateCcw } from 'lucide-react';
+import { Camera, Calendar, Copy, Sparkles, Image as ImageIcon, MapPin, ArrowUp, Loader2, Trash2, RotateCcw, CloudCheck, CloudUpload } from 'lucide-react';
 
 // Memoized individual PhotoCard component to eliminate full grid re-renders
 const PhotoCard = React.memo(function PhotoCard({
@@ -16,6 +16,8 @@ const PhotoCard = React.memo(function PhotoCard({
   const hasDups = photo.duplicate_count > 0;
   const hasGps = photo.latitude !== null && photo.longitude !== null;
   const isTrashed = Boolean(photo.is_trashed);
+  const isBackedUp = photo.gdrive_backup_status === 'backed_up';
+  const isUploading = photo.gdrive_backup_status === 'uploading';
   const simScore = photo.similarity_score !== undefined
     ? Math.round(photo.similarity_score * 100)
     : null;
@@ -73,6 +75,46 @@ const PhotoCard = React.memo(function PhotoCard({
             <span className="badge-trash" title="Tagged for deferred trash deletion">
               <Trash2 size={10} />
               <span>Trash</span>
+            </span>
+          )}
+          {isBackedUp && (
+            <span
+              className="badge-gdrive"
+              title="Backed up to Google Drive"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '3px',
+                padding: '2px 5px',
+                borderRadius: '4px',
+                fontSize: '10px',
+                fontWeight: 600,
+                background: 'rgba(16, 185, 129, 0.3)',
+                color: '#6ee7b7',
+                backdropFilter: 'blur(4px)',
+                border: '1px solid rgba(16, 185, 129, 0.4)'
+              }}
+            >
+              <CloudCheck size={10} />
+              <span>Drive</span>
+            </span>
+          )}
+          {isUploading && (
+            <span
+              className="badge-gdrive-sync"
+              title="Syncing to Google Drive..."
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                padding: '2px 5px',
+                borderRadius: '4px',
+                background: 'rgba(6, 182, 212, 0.3)',
+                color: '#67e8f9',
+                backdropFilter: 'blur(4px)',
+                border: '1px solid rgba(6, 182, 212, 0.4)'
+              }}
+            >
+              <CloudUpload size={10} className="animate-pulse" />
             </span>
           )}
           {simScore !== null && (
