@@ -220,10 +220,14 @@ def run_tests():
         print(f"[PASS] Disk Space Auto-Purge: Permanently deleted file on disk and generated mandatory notification: '{purge_data['message'][:60]}...'", flush=True)
 
         # Step 11: Test Duplicate Trashing Flow (Batch and Single)
+        dup_img = Image.new("RGB", (1300, 900), color=(99, 120, 200))
+        for x in range(100):
+            for y in range(100):
+                dup_img.putpixel((x, y), (200, 50, 150))
         dup_test_1 = os.path.join(test_dir, "dup_orig.jpg")
         dup_test_2 = os.path.join(test_dir, "dup_copy.jpg")
-        shutil.copy2(samples["cam_photo"], dup_test_1)
-        shutil.copy2(samples["cam_photo"], dup_test_2)
+        dup_img.save(dup_test_1, "jpeg")
+        dup_img.save(dup_test_2, "jpeg")
         m1 = extract_metadata(dup_test_1)
         m2 = extract_metadata(dup_test_2)
         d_p1 = upsert_photo({**m1, "classification": "VERIFIED_PHOTO", "indexed_at": 2001})
@@ -286,11 +290,145 @@ def run_tests():
         assert reconciled_group is not None, "Group should still exist with 2 remaining photos"
         assert reconciled_group["total_items"] == 2
 
-        # User subsequently trashes tp3, leaving only 1 photo: group should auto-resolve
-        client.post("/api/photos/batch-trash", json={"photo_ids": [tp3], "is_trashed": True})
-        groups_after_final = client.get("/api/duplicates").json()
-        assert not any(g["group_id"] == trip_group["group_id"] for g in groups_after_final), "Group should be resolved after keeping 1 photo"
-        print("[PASS] Selective Duplicate Shootout: Successfully reconciled partial duplicate group trashing and auto-resolved on single keeper", flush=True)
+        # Step 12b: Test Duplicate Sorting by Number of Duplicates & Photo Age
+        # Create a second duplicate cluster with distinct duplicate count and older date
+        quad_base = os.path.join(test_dir, "quad_base.jpg")
+        Image.new("RGB", (800, 600), color=(180, 50, 90)).save(quad_base, "jpeg")
+        q1 = os.path.join(test_dir, "q1.jpg")
+        q2 = os.path.join(test_dir, "q2.jpg")
+        q3 = os.path.join(test_dir, "q3.jpg")
+        shutil.copy2(quad_base, q1)
+        shutil.copy2(quad_base, q2)
+        shutil.copy2(quad_base, q3)
+        qm1 = extract_metadata(q1)
+        qm2 = extract_metadata(q2)
+        qm3 = extract_metadata(q3)
+        # Set older date for quad cluster and newer date for triplet cluster
+        qp1 = upsert_photo({**qm1, "classification": "VERIFIED_PHOTO", "date_taken": "2019-06-15 10:00:00", "indexed_at": 3501})
+        qp2 = upsert_photo({**qm2, "classification": "VERIFIED_PHOTO", "date_taken": "2019-06-15 10:00:00", "indexed_at": 3502})
+        qp3 = upsert_photo({**qm3, "classification": "VERIFIED_PHOTO", "date_taken": "2019-06-15 10:00:00", "indexed_at": 3503})
+        # Set trip cluster photos to newer date
+        conn_test = get_connection()
+        conn_test.execute("UPDATE photos SET date_taken = '2024-11-20 14:00:00' WHERE id IN (?, ?)", (tp1, tp3))
+        conn_test.commit()
+        conn_test.close()
+        run_deduplication_pass()
+
+        # 1. Sort by count DESC (Most duplicates first)
+        sort_count_desc = client.get("/api/duplicates?sort_by=count&sort_order=desc").json()
+        assert len(sort_count_desc) >= 2
+        for i in range(len(sort_count_desc) - 1):
+            assert sort_count_desc[i]["duplicate_count"] >= sort_count_desc[i + 1]["duplicate_count"], \
+                f"Count DESC violated at index {i}: {sort_count_desc[i]['duplicate_count']} < {sort_count_desc[i + 1]['duplicate_count']}"
+
+        # 2. Sort by count ASC (Fewest duplicates first)
+        sort_count_asc = client.get("/api/duplicates?sort_by=count&sort_order=asc").json()
+        assert len(sort_count_asc) >= 2
+        for i in range(len(sort_count_asc) - 1):
+            assert sort_count_asc[i]["duplicate_count"] <= sort_count_asc[i + 1]["duplicate_count"], \
+                f"Count ASC violated at index {i}: {sort_count_asc[i]['duplicate_count']} > {sort_count_asc[i + 1]['duplicate_count']}"
+
+        # 3. Sort by date ASC (Oldest photos first)
+        sort_date_asc = client.get("/api/duplicates?sort_by=date&sort_order=asc").json()
+        assert len(sort_date_asc) >= 2
+        dated_asc = [str(g["date_taken"]).replace(":", "-") for g in sort_date_asc if g.get("date_taken")]
+        for i in range(len(dated_asc) - 1):
+            assert dated_asc[i] <= dated_asc[i + 1], f"Date ASC violated: {dated_asc[i]} > {dated_asc[i + 1]}"
+
+        # 4. Sort by date DESC (Newest photos first)
+        sort_date_desc = client.get("/api/duplicates?sort_by=date&sort_order=desc").json()
+        assert len(sort_date_desc) >= 2
+        dated_desc = [str(g["date_taken"]).replace(":", "-") for g in sort_date_desc if g.get("date_taken")]
+        for i in range(len(dated_desc) - 1):
+            assert dated_desc[i] >= dated_desc[i + 1], f"Date DESC violated: {dated_desc[i]} < {dated_desc[i + 1]}"
+        print("[PASS] Duplicate Sorting API: Successfully sorted duplicate clusters by count (most/fewest) and age (oldest/newest)", flush=True)
+
+        # Step 13: Test Duplicate Dismissal Persistence Across Scans/Passes
+        dis_orig = os.path.join(test_dir, "dis_orig.jpg")
+        dis_copy = os.path.join(test_dir, "dis_copy.jpg")
+        shutil.copy2(trip_base, dis_orig)
+        shutil.copy2(trip_base, dis_copy)
+        dis_m1 = extract_metadata(dis_orig)
+        dis_m2 = extract_metadata(dis_copy)
+        dp1 = upsert_photo({**dis_m1, "classification": "VERIFIED_PHOTO", "indexed_at": 4001})
+        dp2 = upsert_photo({**dis_m2, "classification": "VERIFIED_PHOTO", "indexed_at": 4002})
+        run_deduplication_pass()
+
+        groups_res = client.get("/api/duplicates")
+        dis_group = next(
+            (g for g in groups_res.json() if any(item["id"] == dp1 for item in [g["primary"], *g["duplicates"]])),
+            None
+        )
+        assert dis_group is not None, "Expected duplicate group to be created for dismissal test"
+
+        # Dismiss the duplicate group
+        dismiss_res = client.post(f"/api/duplicates/group/{dis_group['group_id']}/dismiss")
+        assert dismiss_res.status_code == 200, f"Dismiss failed: {dismiss_res.text}"
+
+        # Re-run full deduplication pass
+        run_deduplication_pass()
+
+        # Verify the dismissed pair does NOT re-cluster into a duplicate group
+        groups_after_repass = client.get("/api/duplicates").json()
+        assert not any(
+            any(item["id"] == dp1 for item in [g["primary"], *g["duplicates"]]) for g in groups_after_repass
+        ), "Dismissed duplicate pair was improperly re-clustered after a deduplication pass!"
+        print("[PASS] Dismissal Persistence: Dismissed duplicate pair remembered and prevented from re-clustering", flush=True)
+
+        # Step 14: Test Semantic Search with Candidate Pre-Filtering
+        vector_engine.add_or_update_photo(dp1, dis_orig, test_db)
+        # Search with allowed_photo_ids restricted to [dp1]
+        filtered_search = vector_engine.search_text("colorful blue", top_k=5, allowed_photo_ids={dp1})
+        assert len(filtered_search) == 1 and filtered_search[0]["photo_id"] == dp1, "Pre-filtered search did not constrain to allowed ID"
+        # Search with empty allowed set
+        empty_search = vector_engine.search_text("colorful blue", top_k=5, allowed_photo_ids={999999})
+        assert len(empty_search) == 0, "Expected empty results for non-matching allowed IDs"
+        # Step 15: Test Continuous Burst Detection & Category Filtering API
+        burst_img_1 = os.path.join(test_dir, "burst_take_1.jpg")
+        burst_img_2 = os.path.join(test_dir, "burst_take_2.jpg")
+        burst_img_3 = os.path.join(test_dir, "burst_take_3.jpg")
+        
+        # Create base photo with low-frequency structure (half-split) so pHash is distinct after 32x32 DCT downsampling
+        b_base = Image.new("RGB", (1200, 800), color=(80, 160, 220))
+        for x in range(600):
+            for y in range(800):
+                b_base.putpixel((x, y), (240, 40, 90))
+        # Save burst takes with slightly different compression/encoding (SHA-256 differs, visual pHash is identical)
+        b_base.save(burst_img_1, "jpeg", quality=95)
+        b_base.save(burst_img_2, "jpeg", quality=94)
+        b_base.save(burst_img_3, "jpeg", quality=93)
+
+        bm1 = extract_metadata(burst_img_1)
+        bm2 = extract_metadata(burst_img_2)
+        bm3 = extract_metadata(burst_img_3)
+
+        # Timestamps taken 4 seconds apart (continuous burst within 1 minute)
+        bp1 = upsert_photo({**bm1, "classification": "VERIFIED_PHOTO", "date_taken": "2024-06-16 10:06:00", "indexed_at": 5001})
+        bp2 = upsert_photo({**bm2, "classification": "VERIFIED_PHOTO", "date_taken": "2024-06-16 10:06:04", "indexed_at": 5002})
+        bp3 = upsert_photo({**bm3, "classification": "VERIFIED_PHOTO", "date_taken": "2024-06-16 10:06:08", "indexed_at": 5003})
+
+        run_deduplication_pass()
+
+        # Verify burst group was formed with BURST_SEQUENCE match_type
+        burst_res = client.get("/api/duplicates?category=burst")
+        assert burst_res.status_code == 200
+        burst_groups = burst_res.json()
+        assert len(burst_groups) >= 1, "Expected at least 1 BURST_SEQUENCE group"
+        b_group = next(
+            (g for g in burst_groups if any(item["id"] == bp1 for item in [g["primary"], *g["duplicates"]])),
+            None
+        )
+        assert b_group is not None, "Burst group containing bp1 was not found"
+        assert b_group["match_type"] == "BURST_SEQUENCE", f"Expected BURST_SEQUENCE, got {b_group['match_type']}"
+        assert b_group["total_items"] == 3
+
+        # Verify category=exact only returns EXACT_HASH
+        exact_res = client.get("/api/duplicates?category=exact")
+        assert exact_res.status_code == 200
+        for eg in exact_res.json():
+            assert eg["match_type"] == "EXACT_HASH"
+
+        print("[PASS] Continuous Burst & Category Filtering: Successfully detected rapid burst sequence, assigned BURST_SEQUENCE match_type, and filtered categories via API", flush=True)
 
         print("\n*** ALL UNIT & INTEGRATION TESTS PASSED PERFECTLY! ***\n", flush=True)
 

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
-import { Camera, Calendar, Copy, Sparkles, Image as ImageIcon, MapPin, ArrowUp, Loader2, Trash2, RotateCcw } from 'lucide-react';
+import { Camera, Calendar, Copy, Sparkles, Image as ImageIcon, MapPin, ArrowUp, Loader2, Trash2, RotateCcw, CloudCheck, CloudUpload } from 'lucide-react';
 
 // Memoized individual PhotoCard component to eliminate full grid re-renders
 const PhotoCard = React.memo(function PhotoCard({
@@ -16,6 +16,8 @@ const PhotoCard = React.memo(function PhotoCard({
   const hasDups = photo.duplicate_count > 0;
   const hasGps = photo.latitude !== null && photo.longitude !== null;
   const isTrashed = Boolean(photo.is_trashed);
+  const isBackedUp = photo.gdrive_backup_status === 'backed_up';
+  const isUploading = photo.gdrive_backup_status === 'uploading';
   const simScore = photo.similarity_score !== undefined
     ? Math.round(photo.similarity_score * 100)
     : null;
@@ -75,6 +77,46 @@ const PhotoCard = React.memo(function PhotoCard({
               <span>Trash</span>
             </span>
           )}
+          {isBackedUp && (
+            <span
+              className="badge-gdrive"
+              title="Backed up to Google Drive"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '3px',
+                padding: '2px 5px',
+                borderRadius: '4px',
+                fontSize: '10px',
+                fontWeight: 600,
+                background: 'rgba(16, 185, 129, 0.3)',
+                color: '#6ee7b7',
+                backdropFilter: 'blur(4px)',
+                border: '1px solid rgba(16, 185, 129, 0.4)'
+              }}
+            >
+              <CloudCheck size={10} />
+              <span>Drive</span>
+            </span>
+          )}
+          {isUploading && (
+            <span
+              className="badge-gdrive-sync"
+              title="Syncing to Google Drive..."
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                padding: '2px 5px',
+                borderRadius: '4px',
+                background: 'rgba(6, 182, 212, 0.3)',
+                color: '#67e8f9',
+                backdropFilter: 'blur(4px)',
+                border: '1px solid rgba(6, 182, 212, 0.4)'
+              }}
+            >
+              <CloudUpload size={10} className="animate-pulse" />
+            </span>
+          )}
           {simScore !== null && (
             <span className="badge-sim">
               <Sparkles size={10} />
@@ -103,7 +145,7 @@ const PhotoCard = React.memo(function PhotoCard({
           <span className="photo-card-camera">
             {photo.camera_model || photo.camera_make || (photo.width ? `${photo.width}×${photo.height}` : 'Photo')}
           </span>
-          <span>{formatDate(photo.date_taken)}</span>
+          <span>{formatDate(photo.date_taken || (photo.file_modified_at ? new Date(photo.file_modified_at * 1000).toISOString() : ''))}</span>
         </div>
       </div>
     </div>
@@ -168,20 +210,36 @@ export default function PhotoGrid({
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const getEffectiveDate = (photo) => {
+    if (!photo) return null;
+    if (photo.date_taken) return photo.date_taken;
+    if (photo.file_modified_at) {
+      try {
+        return new Date(photo.file_modified_at * 1000).toISOString();
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
+
   const formatDate = (isoString) => {
     if (!isoString) return '';
     try {
       const d = new Date(isoString);
+      if (isNaN(d.getTime())) return '';
       return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
     } catch {
       return '';
     }
   };
 
-  const formatMonthYear = (isoString) => {
-    if (!isoString) return 'Undated Photos';
+  const formatMonthYear = (photo) => {
+    const effective = getEffectiveDate(photo);
+    if (!effective) return 'Undated Photos';
     try {
-      const d = new Date(isoString);
+      const d = new Date(effective);
+      if (isNaN(d.getTime())) return 'Undated Photos';
       return d.toLocaleDateString(undefined, { year: 'numeric', month: 'long' });
     } catch {
       return 'Undated Photos';
@@ -199,7 +257,7 @@ export default function PhotoGrid({
     let currentItems = [];
 
     for (const photo of photos) {
-      const title = formatMonthYear(photo.date_taken);
+      const title = formatMonthYear(photo);
       if (title !== currentTitle) {
         if (currentItems.length > 0) {
           sections.push({ title: currentTitle, items: currentItems });

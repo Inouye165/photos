@@ -11,12 +11,12 @@ from dateutil.relativedelta import relativedelta
 
 # Conversational filler prefixes and phrases
 CONVERSATIONAL_PREFIXES = [
-    r"^show\s+me\s+(?:all\s+)?(?:photos|pictures|images|pics|screenshots|files)?\s*(?:of|from|with|about)?",
-    r"^find\s+(?:me\s+)?(?:all\s+)?(?:photos|pictures|images|pics|screenshots|files)?\s*(?:of|from|with|about)?",
-    r"^(?:where\s+are|look\s+for|search\s+for|display|bring\s+up)\s+(?:all\s+)?(?:photos|pictures|images|pics|screenshots|files)?\s*(?:of|from|with|about)?",
-    r"^i\s+(?:want|would\s+like)\s+to\s+see\s+(?:all\s+)?(?:photos|pictures|images|pics|screenshots|files)?\s*(?:of|from|with|about)?",
-    r"^can\s+you\s+(?:show|find)\s+(?:me\s+)?(?:all\s+)?(?:photos|pictures|images|pics|screenshots|files)?\s*(?:of|from|with|about)?",
-    r"^(?:photos|pictures|pics|images|screenshots)\s+(?:of|from|with|about)\s+"
+    r"^show\s+me\s+(?:all\s+)?(?:photos?|pictures?|images?|pics?|screenshots?|files)?\s*(?:of|from|with|about)?\s*",
+    r"^find\s+(?:me\s+)?(?:all\s+)?(?:photos?|pictures?|images?|pics?|screenshots?|files)?\s*(?:of|from|with|about)?\s*",
+    r"^(?:where\s+are|look\s+for|search\s+for|display|bring\s+up)\s+(?:all\s+)?(?:photos?|pictures?|images?|pics?|screenshots?|files)?\s*(?:of|from|with|about)?\s*",
+    r"^i\s+(?:want|would\s+like)\s+to\s+see\s+(?:all\s+)?(?:photos?|pictures?|images?|pics?|screenshots?|files)?\s*(?:of|from|with|about)?\s*",
+    r"^can\s+you\s+(?:show|find)\s+(?:me\s+)?(?:all\s+)?(?:photos?|pictures?|images?|pics?|screenshots?|files)?\s*(?:of|from|with|about)?\s*",
+    r"^(?:photos?|pictures?|pics?|images?|screenshots?)\s+(?:of|from|with|about)\s+"
 ]
 
 MONTH_NAMES = {
@@ -112,11 +112,16 @@ class QueryParser:
         working = text
 
         # 1. Detect classification intent (real photo vs screenshot)
-        classification = "REAL_PHOTOS"
+        classification = "ALL"
         if re.search(r"\b(screenshot|screenshots|screen\s*grab|screen\s*shot)\b", working, re.I):
             classification = "SCREENSHOT"
+            working = re.sub(r"\b(screenshot|screenshots|screen\s*grab|screen\s*shot)s?\b", "", working, flags=re.I).strip()
+        elif re.search(r"\b(photo|photos|picture|pictures|pic|pics|camera)\b", working, re.I):
+            classification = "REAL_PHOTOS"
+            working = re.sub(r"\b(photos?|pictures?|pics?|camera)\b", "", working, flags=re.I).strip()
         elif re.search(r"\b(all\s+files|everything|all\s+photos\s+and\s+screenshots)\b", working, re.I):
             classification = "ALL"
+            working = re.sub(r"\b(all\s+files|everything|all\s+photos\s+and\s+screenshots)\b", "", working, flags=re.I).strip()
 
         # 2. Extract parenthetical entity annotations like "dobby(my dog)" or "charlie (pet cat)"
         entities = []
@@ -173,10 +178,11 @@ class QueryParser:
                     entities.append({"name": kf.capitalize(), "type": "folder"})
 
         # 7. Clean and construct the visual prompt for CLIP
-        # Remove trailing/leading prepositions like "at", "in", "on", "from" left behind
+        # Remove trailing/leading prepositions like "at", "in", "on", "from", "of", "a", "an" left behind
         visual_tokens = re.sub(r"\s+", " ", cleaned).strip()
-        visual_tokens = re.sub(r"^(?:at|in|on|from|with|during)\s+", "", visual_tokens, flags=re.I)
-        visual_tokens = re.sub(r"\s+(?:at|in|on|from|with|during)$", "", visual_tokens, flags=re.I)
+        visual_tokens = re.sub(r"^(?:at|in|on|from|with|during|of|a|an)\s+", "", visual_tokens, flags=re.I)
+        visual_tokens = re.sub(r"^(?:at|in|on|from|with|during|of|a|an)\s+", "", visual_tokens, flags=re.I)
+        visual_tokens = re.sub(r"\s+(?:at|in|on|from|with|during|of)$", "", visual_tokens, flags=re.I)
         visual_tokens = re.sub(r"[!?,.]", "", visual_tokens).strip()
 
         # If visual tokens became empty, fall back to entities or working

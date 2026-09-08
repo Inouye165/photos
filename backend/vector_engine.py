@@ -11,6 +11,7 @@ from PIL import Image
 from typing import List, Tuple, Dict, Any, Optional, cast
 from sentence_transformers import SentenceTransformer
 from backend.database import get_connection, DB_PATH
+from backend.thumbnails import get_thumbnail_path
 
 try:
     import pillow_heif
@@ -108,19 +109,43 @@ class VectorEngine:
                 embeddings=self.embeddings
             )
 
-    def encode_image(self, file_path: str) -> Optional[np.ndarray]:
-        """Encodes an image file into a normalized 512-dim embedding vector."""
+    def _open_efficient_image(self, file_path: str, photo_id: Optional[int] = None) -> Optional[Image.Image]:
+        """Loads cached thumbnail if available or downsamples original to 512px to minimize RAM usage."""
+        if photo_id is not None:
+            # Check for fast cached preview or thumb first
+            for size_name in ("preview", "thumb"):
+                cached_thumb = get_thumbnail_path(photo_id, size_name)
+                if os.path.exists(cached_thumb):
+                    try:
+                        with Image.open(cached_thumb) as t_img:
+                            return t_img.convert("RGB")
+                    except Exception:
+                        pass
+
+        # Fall back to opening original, downsampled immediately
         try:
             with Image.open(file_path) as img:
-                rgb_img = img.convert("RGB") if img.mode != "RGB" else img
-                emb = cast(Any, self.model).encode([rgb_img], show_progress_bar=False, normalize_embeddings=True)[0]
-                return np.array(emb, dtype=np.float32)
+                img_copy = img.copy()
+                if max(img_copy.size) > 512:
+                    img_copy.thumbnail((512, 512), Image.Resampling.BILINEAR)
+                return img_copy.convert("RGB") if img_copy.mode != "RGB" else img_copy
+        except Exception:
+            return None
+
+    def encode_image(self, file_path: str, photo_id: Optional[int] = None) -> Optional[np.ndarray]:
+        """Encodes an image file into a normalized 512-dim embedding vector using efficient image loading."""
+        rgb_img = self._open_efficient_image(file_path, photo_id)
+        if rgb_img is None:
+            return None
+        try:
+            emb = cast(Any, self.model).encode([rgb_img], show_progress_bar=False, normalize_embeddings=True)[0]
+            return np.array(emb, dtype=np.float32)
         except Exception:
             return None
 
     def add_or_update_photo(self, photo_id: int, file_path: str, db_path: str = DB_PATH) -> bool:
         """Computes and indexes embedding for a single photo."""
-        emb = self.encode_image(file_path)
+        emb = self.encode_image(file_path, photo_id)
         if emb is None:
             return False
 
@@ -147,7 +172,7 @@ class VectorEngine:
         return True
 
     def batch_index_photos(self, photos: List[Tuple[int, str]], batch_size: int = 32, progress_callback=None, db_path: str = DB_PATH):
-        """Batched embedding computation for fast indexing."""
+        """Batched embedding computation utilizing cached thumbnails for fast, low-RAM indexing."""
         total = len(photos)
         indexed_count = 0
 
@@ -157,13 +182,10 @@ class VectorEngine:
             valid_images = []
 
             for pid, fpath in batch:
-                try:
-                    with Image.open(fpath) as img:
-                        rgb = img.convert("RGB") if img.mode != "RGB" else img
-                        valid_images.append(rgb.copy())
-                        valid_ids.append(pid)
-                except Exception:
-                    continue
+                img = self._open_efficient_image(fpath, pid)
+                if img is not None:
+                    valid_images.append(img)
+                    valid_ids.append(pid)
 
             if valid_images:
                 try:
@@ -189,7 +211,7 @@ class VectorEngine:
                                 else:
                                     self.embeddings = np.vstack([self.embeddings, emb])
 
-                    conn = get_connection()
+                    conn = get_connection(db_path)
                     placeholders = ",".join("?" for _ in valid_ids)
                     conn.execute(f"UPDATE photos SET has_embedding = 1 WHERE id IN ({placeholders})", valid_ids)
                     conn.commit()
@@ -205,10 +227,17 @@ class VectorEngine:
         self.save_index()
         return indexed_count
 
-    def search_text(self, query: str, top_k: int = 50, min_similarity: float = 0.16) -> List[Dict[str, Any]]:
+    def search_text(
+        self,
+        query: str,
+        top_k: int = 50,
+        min_similarity: float = 0.16,
+        allowed_photo_ids: Optional[Any] = None
+    ) -> List[Dict[str, Any]]:
         """
         Performs semantic natural language search.
         Encodes query text into vector space and computes cosine similarity with indexed photos.
+        If allowed_photo_ids is specified, restricts similarity ranking strictly to matching metadata candidates.
         """
         if not query or not query.strip() or self.embeddings is None or len(self.photo_ids) == 0:
             return []
@@ -219,8 +248,30 @@ class VectorEngine:
 
         # Cosine similarity is dot product of normalized vectors
         scores = np.dot(self.embeddings, query_emb)
-        
-        # Sort descending
+
+        # If filtered candidates are provided, slice down to the candidate subset before top_k
+        if allowed_photo_ids is not None:
+            allowed_set = set(allowed_photo_ids) if not isinstance(allowed_photo_ids, set) else allowed_photo_ids
+            candidate_indices = [i for i, pid in enumerate(self.photo_ids) if pid in allowed_set]
+            if not candidate_indices:
+                return []
+
+            sub_scores = scores[candidate_indices]
+            sorted_sub_order = np.argsort(sub_scores)[::-1]
+
+            results = []
+            for rank in sorted_sub_order[:top_k]:
+                orig_idx = candidate_indices[rank]
+                score = float(scores[orig_idx])
+                if score < min_similarity and len(results) >= 10:
+                    break
+                results.append({
+                    "photo_id": int(self.photo_ids[orig_idx]),
+                    "similarity_score": round(score, 4)
+                })
+            return results
+
+        # Global ranking without pre-filter
         top_indices = np.argsort(scores)[::-1]
 
         results = []
@@ -234,3 +285,4 @@ class VectorEngine:
             })
 
         return results
+

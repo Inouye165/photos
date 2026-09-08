@@ -7,9 +7,11 @@ exact duplicates, near-duplicates, and screenshots.
 import os
 import shutil
 import piexif
-from PIL import Image, ImageDraw
+from typing import Optional
 
-def create_sample_library(base_path: str = r"c:\Users\inouy\photos\sample_library"):
+def create_sample_library(base_path: Optional[str] = None):
+    if base_path is None:
+        base_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_library")
     os.makedirs(base_path, exist_ok=True)
 
     folders = [
