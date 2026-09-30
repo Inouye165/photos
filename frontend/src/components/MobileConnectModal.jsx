@@ -45,7 +45,7 @@ export default function MobileConnectModal({ isOpen, onClose }) {
         </div>
 
         <p style={{ fontSize: '0.875rem', color: '#94a3b8', marginBottom: '1.5rem', lineHeight: '1.4' }}>
-          Scan the QR code with your phone camera or visit the URL below on any device connected to your home Wi-Fi network.
+          Scan the QR code with your phone camera or open the URL below to pair a device on your home Wi-Fi network.
         </p>
 
         {/* QR Code Container */}
@@ -108,7 +108,7 @@ export default function MobileConnectModal({ isOpen, onClose }) {
         }}>
           <ShieldCheck size={16} style={{ flexShrink: 0 }} />
           <span>
-            Zero file moving: The app accesses original photos in-place through pointers without copying or modifying them.
+            Pairing grants this browser access to the library for seven days. Original photos remain in place and are not modified.
           </span>
         </div>
       </div>

@@ -82,6 +82,9 @@ def classify_media(metadata: Dict[str, Any]) -> Tuple[str, float, str]:
     if ext in {".gif", ".ico", ".svg", ".cur", ".bmp"}:
         return "SYSTEM_ASSET", 0.95, f"Non-photo extension ({ext})"
 
+    if metadata.get("format") == "UNREADABLE":
+        return "UNSUPPORTED", 1.0, "Image could not be decoded"
+
     # 3. Definite Camera Photo via EXIF Hardware Fingerprint
     camera_make_lower = (camera_make or "").lower()
     is_known_camera = any(brand in camera_make_lower for brand in KNOWN_CAMERA_MAKES)

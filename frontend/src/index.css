@@ -520,6 +520,37 @@ body {
   transition: transform 0.4s ease;
 }
 
+.photo-card-image-fallback {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #64748b;
+  background: #0d1017;
+}
+
+.photo-card-image-retry {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 4px;
+  color: #cbd5e1;
+  background: #171c26;
+  cursor: pointer;
+}
+
+.photo-card-image-retry:hover {
+  color: #ffffff;
+  border-color: rgba(16, 185, 129, 0.65);
+  background: #202735;
+}
+
 .photo-card:hover .photo-card-img {
   transform: scale(1.04);
 }
@@ -563,6 +594,14 @@ body {
   padding: 0.75rem 0.9rem;
 }
 
+.photo-card-name-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 0.25rem;
+}
+
 .photo-card-name {
   font-size: 0.85rem;
   font-weight: 600;
@@ -570,7 +609,33 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-bottom: 0.25rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.photo-card-orig-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  text-decoration: none;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+  line-height: 1.2;
+}
+
+.photo-card-orig-badge:hover {
+  background: rgba(56, 189, 248, 0.28);
+  border-color: #38bdf8;
+  color: #ffffff;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(56, 189, 248, 0.3);
 }
 
 .photo-card-meta {
@@ -1073,6 +1138,41 @@ body {
 }
 
 /* Quick Trash Button & Trashed Photo Card Styling */
+.quick-orig-btn {
+  position: absolute;
+  top: 8px;
+  right: 42px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(15, 23, 42, 0.75);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #94a3b8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transform: scale(0.85);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 10;
+  text-decoration: none;
+}
+
+.photo-card:hover .quick-orig-btn {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.quick-orig-btn:hover {
+  background: rgba(56, 189, 248, 0.9);
+  color: #ffffff;
+  border-color: #38bdf8;
+  transform: scale(1.1);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.5);
+}
+
 .quick-trash-btn {
   position: absolute;
   top: 8px;
@@ -1809,6 +1909,7 @@ body {
 }
 
 .confirm-preview-thumb {
+  position: relative;
   width: 48px;
   height: 48px;
   border-radius: 8px;

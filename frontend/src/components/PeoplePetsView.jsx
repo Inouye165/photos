@@ -33,7 +33,7 @@ import {
   setEntityAvatar,
   confirmBox,
   rejectBox,
-  batchConfirmBoxes,
+  confirmAllPendingReviews,
   startPeoplePetsScan,
   fetchPeoplePetsScanStatus
 } from '../api';
@@ -65,6 +65,7 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
   const [isReviewModalOpen, setIsReviewModalOpen] = useState(false);
   const [reviewIndex, setReviewIndex] = useState(0);
   const [isProcessingAction, setIsProcessingAction] = useState(false);
+  const [isLoadingMorePending, setIsLoadingMorePending] = useState(false);
 
   // Add Entity Modal State
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -97,6 +98,23 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
         setLoading(false);
       });
   }, [unassignedTypeFilter]);
+
+  const handleLoadMorePending = async () => {
+    if (isLoadingMorePending || pendingReviews.length >= totalPending) return;
+    setIsLoadingMorePending(true);
+    try {
+      const page = await fetchPendingReviews({ limit: 100, offset: pendingReviews.length });
+      setPendingReviews((current) => {
+        const existingIds = new Set(current.map((item) => item.id));
+        return [...current, ...(page.items || []).filter((item) => !existingIds.has(item.id))];
+      });
+      setTotalPending(page.total || 0);
+    } catch (err) {
+      alert('Failed to load more suggestions: ' + err.message);
+    } finally {
+      setIsLoadingMorePending(false);
+    }
+  };
 
   useEffect(() => {
     loadData();
@@ -165,11 +183,10 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
   };
 
   const handleConfirmAll = async () => {
-    if (pendingReviews.length === 0) return;
-    const boxIds = pendingReviews.map((b) => b.id);
+    if (totalPending === 0) return;
     try {
       setIsProcessingAction(true);
-      await batchConfirmBoxes(boxIds);
+      await confirmAllPendingReviews();
       setPendingReviews([]);
       setTotalPending(0);
       setIsReviewModalOpen(false);
@@ -298,6 +315,9 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
   });
 
   const activeReviewItem = pendingReviews[reviewIndex];
+  const reviewConfidence = activeReviewItem && Number.isFinite(activeReviewItem.match_confidence)
+    ? Math.round(Math.max(0, Math.min(1, activeReviewItem.match_confidence)) * 100)
+    : null;
 
   return (
     <div className="people-pets-view">
@@ -419,9 +439,18 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
                 setIsReviewModalOpen(true);
               }}
             >
-              <span>Review One by One</span>
+              <span>Review Loaded ({pendingReviews.length})</span>
               <ChevronRight size={15} />
             </button>
+            {pendingReviews.length < totalPending && (
+              <button
+                className="btn-secondary"
+                onClick={handleLoadMorePending}
+                disabled={isLoadingMorePending}
+              >
+                {isLoadingMorePending ? 'Loading...' : `Load 100 More (${totalPending - pendingReviews.length} left)`}
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -970,7 +999,7 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
                   Match Confidence:
                 </span>
                 <span style={{ fontSize: '0.9rem', fontWeight: 700, color: '#34d399' }}>
-                  {Math.round((activeReviewItem.match_confidence || 0.85) * 100)}% Match
+                  {reviewConfidence === null ? 'Not available' : `${reviewConfidence}% Match`}
                 </span>
               </div>
 
@@ -979,7 +1008,7 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
                 <div
                   style={{
                     height: '100%',
-                    width: `${Math.round((activeReviewItem.match_confidence || 0.85) * 100)}%`,
+                    width: `${reviewConfidence ?? 0}%`,
                     background: 'linear-gradient(90deg, #10b981, #34d399)'
                   }}
                 />

@@ -20,7 +20,8 @@ import {
   Plus,
   Cloud,
   CloudCheck,
-  CloudUpload
+  CloudUpload,
+  FolderOpen
 } from 'lucide-react';
 import { fetchPhotoDetails, reclassifyPhoto, deletePhoto, tagPhotoTrash } from '../api';
 import BoundingBoxOverlay from './BoundingBoxOverlay';
@@ -111,6 +112,14 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
     }
   };
 
+  const handleRevealInExplorer = async () => {
+    try {
+      await fetch(`/api/photos/${photo.id}/reveal`, { method: 'POST' });
+    } catch (e) {
+      console.error('Failed to reveal file in explorer:', e);
+    }
+  };
+
   const hasGps = details.latitude != null && details.longitude != null && !isNaN(Number(details.latitude)) && !isNaN(Number(details.longitude));
   const mapsUrl = hasGps
     ? `https://www.google.com/maps?q=${details.latitude},${details.longitude}`
@@ -189,10 +198,21 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
               rel="noreferrer"
               className="btn-secondary"
               style={{ textDecoration: 'none', fontSize: '0.8rem', padding: '0.4rem 0.85rem' }}
+              title="Download or open original file"
             >
               <Download size={14} />
               <span className="hide-on-mobile">Original File</span>
             </a>
+
+            <button
+              className="btn-secondary"
+              style={{ fontSize: '0.8rem', padding: '0.4rem 0.75rem', color: '#94a3b8' }}
+              onClick={handleRevealInExplorer}
+              title="Reveal file in Windows Explorer"
+            >
+              <FolderOpen size={14} />
+              <span className="hide-on-mobile">Show in Folder</span>
+            </button>
 
             {/* People & Pets Bounding Box Toggle */}
             <button
@@ -526,8 +546,32 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
             <span className="exif-label">Format</span>
             <span className="exif-value">{details.file_extension?.toUpperCase()}</span>
           </div>
-          <div className="exif-row" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '4px' }}>
-            <span className="exif-label">Original File Path Pointer</span>
+          <div className="exif-row" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: '6px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+              <span className="exif-label">Original File Path Pointer</span>
+              <div style={{ display: 'flex', gap: '4px' }}>
+                <a
+                  href={originalUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="photo-card-orig-badge"
+                  title="Open or download original file"
+                >
+                  <ExternalLink size={10} />
+                  <span>Open</span>
+                </a>
+                <button
+                  type="button"
+                  onClick={handleRevealInExplorer}
+                  className="photo-card-orig-badge"
+                  title="Reveal in Windows File Explorer"
+                  style={{ cursor: 'pointer', background: 'rgba(255, 255, 255, 0.08)', borderColor: 'rgba(255, 255, 255, 0.2)', color: '#cbd5e1' }}
+                >
+                  <FolderOpen size={10} />
+                  <span>Folder</span>
+                </button>
+              </div>
+            </div>
             <span className="exif-value" style={{ maxWidth: '100%', textAlign: 'left', fontSize: '0.7rem', color: '#94a3b8', wordBreak: 'break-all', whiteSpace: 'normal' }}>
               {details.file_path}
             </span>

@@ -1,5 +1,6 @@
 import React from 'react';
 import { AlertTriangle, Trash2, X, RotateCcw, Check, Sparkles } from 'lucide-react';
+import RetryImage from './RetryImage';
 
 export default function ConfirmTrashModal({
   isOpen,
@@ -49,11 +50,9 @@ export default function ConfirmTrashModal({
             <div className="confirm-preview-grid">
               {previewPhotos.map((photo) => (
                 <div key={photo.id} className="confirm-preview-thumb" title={photo.file_name}>
-                  <img
-                    src={`/api/photos/${photo.id}/thumbnail`}
+                  <RetryImage
+                    photoId={photo.id}
                     alt={photo.file_name}
-                    loading="lazy"
-                    onError={(e) => { e.target.style.display = 'none'; }}
                   />
                 </div>
               ))}

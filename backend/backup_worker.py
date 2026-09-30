@@ -111,7 +111,7 @@ class BackupWorker:
                 settings = get_backup_settings()
                 is_paused = bool(settings.get("is_paused", 0))
                 hourly_limit = max(1, settings.get("hourly_limit", 25))
-                delay_seconds = max(5.0, settings.get("delay_seconds", 30.0))
+                delay_seconds = max(1.0, settings.get("delay_seconds", 30.0))
 
                 # Check if paused
                 if is_paused:

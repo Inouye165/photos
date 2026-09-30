@@ -321,6 +321,12 @@ export async function batchConfirmBoxes(boxIds) {
   return res.json();
 }
 
+export async function confirmAllPendingReviews() {
+  const res = await fetch(`${API_BASE}/people-pets/pending/confirm-all`, { method: 'POST' });
+  if (!res.ok) throw new Error('Failed to confirm pending suggestions');
+  return res.json();
+}
+
 export async function fetchPhotoBoxes(photoId) {
   const res = await fetch(`${API_BASE}/photos/${photoId}/boxes`);
   if (!res.ok) throw new Error('Failed to fetch photo bounding boxes');
@@ -480,5 +486,66 @@ export async function retryFailedBackups() {
   return res.json();
 }
 
+export async function uploadPhotos(files, onProgress) {
+  const formData = new FormData();
+  for (let i = 0; i < files.length; i++) {
+    formData.append('files', files[i]);
+  }
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE}/photos/upload`);
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          const percent = Math.round((event.loaded / event.total) * 100);
+          onProgress(percent);
+        }
+      };
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch {
+          resolve({ status: 'ok' });
+        }
+      } else {
+        let detail = `Upload failed with status ${xhr.status}`;
+        try {
+          detail = JSON.parse(xhr.responseText).detail || detail;
+        } catch {}
+        reject(new Error(detail));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Network error during upload'));
+    xhr.send(formData);
+  });
+}
 
+export async function fetchWatcherStatus() {
+  const res = await fetch(`${API_BASE}/watcher/status`);
+  if (!res.ok) throw new Error('Failed to fetch watcher status');
+  return res.json();
+}
 
+export async function toggleWatcher(enabled) {
+  const res = await fetch(`${API_BASE}/watcher/toggle`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled })
+  });
+  if (!res.ok) throw new Error('Failed to toggle watcher');
+  return res.json();
+}
+
+export async function fetchDbBackupStatus() {
+  const res = await fetch(`${API_BASE}/system/database-backup/status`);
+  if (!res.ok) throw new Error('Failed to fetch database backup status');
+  return res.json();
+}
+
+export async function triggerDbBackup() {
+  const res = await fetch(`${API_BASE}/system/database-backup`, { method: 'POST' });
+  if (!res.ok) throw new Error('Failed to create database backup');
+  return res.json();
+}
