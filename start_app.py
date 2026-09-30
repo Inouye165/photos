@@ -73,9 +73,30 @@ def wait_for_server_and_open_browser(url: str, port: int, timeout: float = 60.0)
     except Exception:
         pass
 
+def free_port_if_in_use(port: int):
+    """Ensure port is free before starting Uvicorn, avoiding WinError 10048."""
+    import subprocess
+    try:
+        cmd = f'netstat -ano | findstr :{port}'
+        output = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+        pids = set()
+        for line in output.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and "LISTENING" in parts[3].upper():
+                pid = int(parts[4])
+                if pid > 0 and pid != os.getpid():
+                    pids.add(pid)
+        for pid in pids:
+            print(f"   [INFO] Port {port} in use by PID {pid}. Freeing port...")
+            subprocess.run(f'taskkill /F /PID {pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.5)
+    except Exception:
+        pass
+
 if __name__ == "__main__":
     port = 8500
     host = "0.0.0.0"
+    free_port_if_in_use(port)
     local_url = f"http://localhost:{port}"
     ips = get_local_ips()
     network_urls = [f"http://{ip}:{port}" for ip in ips]
@@ -100,4 +121,5 @@ if __name__ == "__main__":
 
     # Launch Uvicorn on 0.0.0.0
     uvicorn.run("backend.app:app", host=host, port=port, reload=False)
+
 

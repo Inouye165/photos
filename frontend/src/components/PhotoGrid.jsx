@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
-import { Camera, Calendar, Copy, Sparkles, Image as ImageIcon, MapPin, ArrowUp, Loader2, Trash2, RotateCcw, CloudCheck, CloudUpload } from 'lucide-react';
+import { Camera, Calendar, Copy, Sparkles, Image as ImageIcon, MapPin, ArrowUp, Loader2, Trash2, RotateCcw, CloudCheck, CloudUpload, ExternalLink } from 'lucide-react';
+import RetryImage from './RetryImage';
 
 // Memoized individual PhotoCard component to eliminate full grid re-renders
 const PhotoCard = React.memo(function PhotoCard({
@@ -12,7 +13,7 @@ const PhotoCard = React.memo(function PhotoCard({
   onToggleTrash,
   formatDate
 }) {
-  const thumbUrl = `/api/photos/${photo.id}/thumbnail`;
+  const originalUrl = `/api/photos/${photo.id}/original`;
   const hasDups = photo.duplicate_count > 0;
   const hasGps = photo.latitude !== null && photo.longitude !== null;
   const isTrashed = Boolean(photo.is_trashed);
@@ -32,18 +33,15 @@ const PhotoCard = React.memo(function PhotoCard({
 
   return (
     <div
+      data-photo-id={photo.id}
       className={`photo-card ${isTrashed ? 'trashed-card' : ''} ${isSelectMode ? 'in-select-mode' : ''} ${isSelected ? 'is-selected-card' : ''}`}
       onClick={handleCardClick}
     >
       <div className="photo-card-img-wrap">
-        <img
-          src={thumbUrl}
+        <RetryImage
+          photoId={photo.id}
           alt={photo.file_name}
           className="photo-card-img"
-          loading="lazy"
-          onError={(e) => {
-            e.target.style.display = 'none';
-          }}
         />
 
         {/* Select Mode Checkbox Indicator */}
@@ -52,21 +50,35 @@ const PhotoCard = React.memo(function PhotoCard({
             {isSelected ? <Trash2 size={13} /> : <div className="checkbox-ring" />}
           </div>
         ) : (
-          /* Quick Tag for Trash button - triggers Select Mode */
-          <button
-            className={`quick-trash-btn ${isTrashed ? 'is-active' : ''}`}
-            title={isTrashed ? 'Tagged for trash (Click to restore)' : 'Mark for trash (enters multi-select mode)'}
-            onClick={(e) => {
-              e.stopPropagation();
-              if (onStartTrashSelect) {
-                onStartTrashSelect(photo);
-              } else if (onToggleTrash) {
-                onToggleTrash(photo, !isTrashed);
-              }
-            }}
-          >
-            {isTrashed ? <RotateCcw size={13} /> : <Trash2 size={13} />}
-          </button>
+          <>
+            {/* Quick Link to Original File */}
+            <a
+              href={originalUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="quick-orig-btn"
+              title={`Open / download original: ${photo.file_name}`}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <ExternalLink size={13} />
+            </a>
+
+            {/* Quick Tag for Trash button - triggers Select Mode */}
+            <button
+              className={`quick-trash-btn ${isTrashed ? 'is-active' : ''}`}
+              title={isTrashed ? 'Tagged for trash (Click to restore)' : 'Mark for trash (enters multi-select mode)'}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (onStartTrashSelect) {
+                  onStartTrashSelect(photo);
+                } else if (onToggleTrash) {
+                  onToggleTrash(photo, !isTrashed);
+                }
+              }}
+            >
+              {isTrashed ? <RotateCcw size={13} /> : <Trash2 size={13} />}
+            </button>
+          </>
         )}
         
         {/* Badges */}
@@ -138,8 +150,21 @@ const PhotoCard = React.memo(function PhotoCard({
       </div>
 
       <div className="photo-card-info">
-        <div className="photo-card-name" title={photo.file_name}>
-          {photo.file_name}
+        <div className="photo-card-name-row">
+          <div className="photo-card-name" title={photo.file_name}>
+            {photo.file_name}
+          </div>
+          <a
+            href={originalUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="photo-card-orig-badge"
+            title={`Open / download original: ${photo.file_name}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <ExternalLink size={10} />
+            <span>Orig</span>
+          </a>
         </div>
         <div className="photo-card-meta">
           <span className="photo-card-camera">
@@ -153,6 +178,7 @@ const PhotoCard = React.memo(function PhotoCard({
 });
 
 export default function PhotoGrid({
+  gridRef,
   photos = [],
   totalPhotos = 0,
   onSelectPhoto,
@@ -287,7 +313,7 @@ export default function PhotoGrid({
     );
   }
 
-  if (!photos || photos.length === 0) {
+  if ((!photos || photos.length === 0) && !hasMore) {
     return (
       <div style={{
         textAlign: 'center',
@@ -312,7 +338,7 @@ export default function PhotoGrid({
   }
 
   return (
-    <div className="photo-grid-container">
+    <div ref={gridRef} className="photo-grid-container">
       {/* Progress pill */}
       <div className="photo-progress-bar">
         <span>

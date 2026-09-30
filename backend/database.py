@@ -1032,6 +1032,20 @@ def batch_confirm_boxes(box_ids: List[int], db_path: Optional[str] = None) -> in
     conn.close()
     return count
 
+def confirm_all_pending_boxes(db_path: Optional[str] = None) -> int:
+    """Confirms every currently pending auto-match in one database operation."""
+    import time
+    conn = get_connection(db_path)
+    with conn:
+        cursor = conn.execute(
+            "UPDATE detected_boxes SET status = 'CONFIRMED', reviewed_at = ? "
+            "WHERE status = 'PENDING_REVIEW' AND entity_id IS NOT NULL",
+            (time.time(),)
+        )
+        count = cursor.rowcount
+    conn.close()
+    return count
+
 def get_pending_review_boxes(limit: int = 60, offset: int = 0, entity_id: Optional[int] = None, db_path: Optional[str] = None) -> Tuple[List[Dict[str, Any]], int]:
     """Retrieves all high-confidence auto-matches waiting for user review."""
     conn = get_connection(db_path)

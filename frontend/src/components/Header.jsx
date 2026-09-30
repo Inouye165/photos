@@ -1,5 +1,5 @@
 import React from 'react';
-import { Camera, Copy, ShieldAlert, FolderSearch, Sparkles, RefreshCw, Smartphone, Trash2, User } from 'lucide-react';
+import { Camera, Copy, ShieldAlert, FolderSearch, Sparkles, RefreshCw, Smartphone, Trash2, User, UploadCloud, FileText } from 'lucide-react';
 
 import BackupProgressBar from './BackupProgressBar';
 
@@ -9,6 +9,7 @@ export default function Header({
   stats,
   onOpenScanModal,
   onOpenMobileModal,
+  onOpenUploadModal,
   onRefresh
 }) {
   return (
@@ -96,12 +97,39 @@ export default function Header({
             </span>
           )}
         </button>
+
+        <div style={{ width: '1px', height: '24px', background: 'rgba(255, 255, 255, 0.1)', margin: '0 4px' }} />
+
+        <button
+          className={`nav-tab-btn tab-documents ${activeTab === 'documents' ? 'active' : ''}`}
+          onClick={() => setActiveTab('documents')}
+          style={{
+            borderColor: activeTab === 'documents' ? '#38bdf8' : 'rgba(56, 189, 248, 0.25)',
+            background: activeTab === 'documents' ? 'rgba(56, 189, 248, 0.18)' : 'rgba(56, 189, 248, 0.05)',
+            color: activeTab === 'documents' ? '#38bdf8' : '#7dd3fc',
+            fontWeight: 700
+          }}
+          title="Open Dedicated Documents Studio"
+        >
+          <FileText size={16} />
+          <span>Documents</span>
+        </button>
       </nav>
 
       {/* Header Actions */}
       <div className="header-actions">
         {/* Conservative Google Drive Backup Progress */}
         <BackupProgressBar />
+
+        <button
+          className="btn-secondary"
+          onClick={onOpenUploadModal}
+          title="Upload Photos (Mobile or Desktop)"
+          style={{ borderColor: 'rgba(6, 182, 212, 0.4)', color: '#38bdf8' }}
+        >
+          <UploadCloud size={15} />
+          <span className="hide-on-mobile">Upload</span>
+        </button>
 
         <button
           className="btn-secondary"

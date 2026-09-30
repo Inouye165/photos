@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } from 'react';
 import Header from './components/Header';
 import SemanticSearch from './components/SemanticSearch';
 import PhotoGrid from './components/PhotoGrid';
@@ -9,11 +9,24 @@ import TrashView from './components/TrashView';
 import PeoplePetsView from './components/PeoplePetsView';
 import ScanModal from './components/ScanModal';
 import MobileConnectModal from './components/MobileConnectModal';
+import UploadModal from './components/UploadModal';
 import TimelineScrubber from './components/TimelineScrubber';
 import TrashSelectionBar from './components/TrashSelectionBar';
 import ConfirmTrashModal from './components/ConfirmTrashModal';
+import DocumentsView from './components/DocumentsView';
 import { fetchPhotos, fetchStats, tagPhotoTrash, batchTagTrash } from './api';
-import { Filter, SlidersHorizontal, MapPin, Eye, EyeOff, Sparkles, Copy, ShieldAlert, Smartphone, Calendar, Trash2, CheckSquare, CheckCircle2, User, X } from 'lucide-react';
+import {
+  canLoadMorePhotos,
+  capturePhotoViewportAnchor,
+  createLatestRequestGuard,
+  createOptimisticTrashState,
+  createPendingTrashTracker,
+  excludePhotosById,
+  loadPhotoWindow,
+  mergePhotoPage,
+  restorePhotoViewportAnchor
+} from './utils/photoTrashView';
+import { Filter, SlidersHorizontal, MapPin, Eye, EyeOff, Sparkles, Copy, ShieldAlert, Smartphone, Calendar, Trash2, CheckSquare, CheckCircle2, User, X, FileText } from 'lucide-react';
 
 const PAGE_SIZE = 80;
 
@@ -41,6 +54,19 @@ export default function App() {
 
   // Abort controller ref for canceling in-flight search requests
   const searchAbortRef = useRef(null);
+  const photoGridRef = useRef(null);
+  const pendingPhotoAnchorRef = useRef(null);
+  const loadPhotosRef = useRef(null);
+  const [photoRequestGuard] = useState(createLatestRequestGuard);
+  const [pendingTrashTracker] = useState(createPendingTrashTracker);
+
+  useLayoutEffect(() => {
+    const anchor = pendingPhotoAnchorRef.current;
+    if (!anchor) return;
+
+    pendingPhotoAnchorRef.current = null;
+    restorePhotoViewportAnchor(photoGridRef.current, anchor);
+  }, [photos]);
 
   // Debounce search query updates by 300ms to eliminate typing CPU spikes
   useEffect(() => {
@@ -63,6 +89,7 @@ export default function App() {
   // Modals state
   const [isScanModalOpen, setIsScanModalOpen] = useState(false);
   const [isMobileModalOpen, setIsMobileModalOpen] = useState(false);
+  const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
 
   const loadStats = useCallback(() => {
     fetchStats()
@@ -99,77 +126,121 @@ export default function App() {
     return selectedPhotosList.reduce((acc, p) => acc + (p.file_size || 0), 0);
   }, [selectedPhotosList]);
 
-  const loadPhotos = useCallback((options = {}) => {
+  const loadPhotos = useCallback(async (options = {}) => {
     const isLoadMore = options.isLoadMore || false;
     const searchQuery = options.searchQuery !== undefined ? options.searchQuery : debouncedQuery;
     const yearFilter = options.year !== undefined ? options.year : selectedYear;
 
+    if (isLoadMore && !canLoadMorePhotos({
+      photoCount: photos.length,
+      totalPhotos,
+      hasMore,
+      isLoading,
+      isLoadingMore,
+      hasPendingTrash: pendingTrashTracker.hasPending()
+    })) {
+      return null;
+    }
+
     if (!isLoadMore) {
+      photoRequestGuard.invalidate();
       if (searchAbortRef.current) {
         searchAbortRef.current.abort();
       }
       searchAbortRef.current = new AbortController();
     }
     const signal = !isLoadMore ? searchAbortRef.current?.signal : null;
+    const viewVersion = photoRequestGuard.current();
 
     if (isLoadMore) {
       setIsLoadingMore(true);
-      fetchPhotos({
-        query: searchQuery,
-        year: yearFilter,
-        entityId: options.entityId !== undefined ? options.entityId : selectedEntity?.id || null,
-        includeDuplicates,
-        cameraMake: cameraMake || null,
-        hasGps: hasGps,
-        sortBy,
-        sortOrder,
-        limit: PAGE_SIZE,
-        offset: photos.length,
-        knownTotal: totalPhotos,
-        signal
-      })
-        .then((data) => {
-          const newItems = data.photos || [];
-          setPhotos((prev) => [...prev, ...newItems]);
-          setTotalPhotos(data.total || 0);
-          setHasMore(photos.length + newItems.length < (data.total || 0));
-          setIsLoadingMore(false);
-        })
-        .catch((err) => {
-          if (err?.name === 'AbortError') return;
-          console.error('Error loading more photos:', err);
-          setIsLoadingMore(false);
+      try {
+        const data = await fetchPhotos({
+          query: searchQuery,
+          year: yearFilter,
+          entityId: options.entityId !== undefined ? options.entityId : selectedEntity?.id || null,
+          includeDuplicates,
+          cameraMake: cameraMake || null,
+          hasGps: hasGps,
+          sortBy,
+          sortOrder,
+          limit: PAGE_SIZE,
+          offset: photos.length,
+          knownTotal: totalPhotos,
+          signal
         });
+        if (!photoRequestGuard.isCurrent(viewVersion)) return null;
+
+        const newItems = excludePhotosById(data.photos || [], pendingTrashTracker.pendingIds());
+        const hiddenCount = (data.photos || []).length - newItems.length;
+        const visibleTotal = Math.max(0, (data.total || 0) - hiddenCount);
+        const pageState = mergePhotoPage(photos, newItems, visibleTotal);
+        setPhotos(pageState.photos);
+        setTotalPhotos(visibleTotal);
+        setHasMore(pageState.hasMore);
+        return pageState;
+      } catch (err) {
+        if (err?.name !== 'AbortError' && photoRequestGuard.isCurrent(viewVersion)) {
+          console.error('Error loading more photos:', err);
+        }
+        return null;
+      } finally {
+        if (photoRequestGuard.isCurrent(viewVersion)) {
+          setIsLoadingMore(false);
+        }
+      }
     } else {
       setIsLoading(true);
-      fetchPhotos({
-        query: searchQuery,
-        year: yearFilter,
-        entityId: options.entityId !== undefined ? options.entityId : selectedEntity?.id || null,
-        includeDuplicates,
-        cameraMake: cameraMake || null,
-        hasGps: hasGps,
-        sortBy,
-        sortOrder,
-        limit: PAGE_SIZE,
-        offset: 0,
-        signal
-      })
-        .then((data) => {
-          const items = data.photos || [];
-          setPhotos(items);
-          setTotalPhotos(data.total || 0);
-          setHasMore(items.length < (data.total || 0));
-          setParsedQuery(data.parsed_query || null);
-          setIsLoading(false);
-        })
-        .catch((err) => {
-          if (err?.name === 'AbortError') return;
-          console.error('Error loading photos:', err);
-          setIsLoading(false);
+      setIsLoadingMore(false);
+      try {
+        const state = await loadPhotoWindow({
+          fetchPage: fetchPhotos,
+          queryOptions: {
+            query: searchQuery,
+            year: yearFilter,
+            entityId: options.entityId !== undefined ? options.entityId : selectedEntity?.id || null,
+            includeDuplicates,
+            cameraMake: cameraMake || null,
+            hasGps: hasGps,
+            sortBy,
+            sortOrder,
+            signal
+          },
+          targetCount: Math.max(PAGE_SIZE, options.targetCount || 0),
+          pageSize: PAGE_SIZE,
+          excludedPhotoIds: pendingTrashTracker.activeIds(),
+          shouldContinue: () => photoRequestGuard.isCurrent(viewVersion)
         });
+        if (!state || !photoRequestGuard.isCurrent(viewVersion)) return null;
+
+        const anchor = options.anchor || (
+          options.anchorFirstPhoto && state.photos.length > 0
+            ? { photoId: String(state.photos[0].id), top: options.anchorTop || 0 }
+            : null
+        );
+        if (anchor) pendingPhotoAnchorRef.current = anchor;
+        setPhotos(state.photos);
+        setTotalPhotos(state.totalPhotos);
+        setHasMore(state.hasMore);
+        setParsedQuery(state.parsedQuery);
+        pendingTrashTracker.resolveLoadedView();
+        return state;
+      } catch (err) {
+        if (err?.name !== 'AbortError' && photoRequestGuard.isCurrent(viewVersion)) {
+          console.error('Error loading photos:', err);
+        }
+        return null;
+      } finally {
+        if (photoRequestGuard.isCurrent(viewVersion)) {
+          setIsLoading(false);
+        }
+      }
     }
-  }, [debouncedQuery, selectedYear, selectedEntity, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder, photos.length, totalPhotos]);
+  }, [debouncedQuery, selectedYear, selectedEntity, includeDuplicates, cameraMake, hasGps, sortBy, sortOrder, photos, totalPhotos, hasMore, isLoading, isLoadingMore, photoRequestGuard, pendingTrashTracker]);
+
+  useLayoutEffect(() => {
+    loadPhotosRef.current = loadPhotos;
+  }, [loadPhotos]);
 
   // Initial load or filter changes
   useEffect(() => {
@@ -203,7 +274,14 @@ export default function App() {
   };
 
   const handleLoadMore = () => {
-    if (!isLoadingMore && hasMore && !isLoading) {
+    if (canLoadMorePhotos({
+      photoCount: photos.length,
+      totalPhotos,
+      hasMore,
+      isLoading,
+      isLoadingMore,
+      hasPendingTrash: pendingTrashTracker.hasPending()
+    })) {
       loadPhotos({ isLoadMore: true });
     }
   };
@@ -277,28 +355,63 @@ export default function App() {
   const handleConfirmBatchTrash = async () => {
     if (selectedIds.size === 0) return;
     const idsToTrash = Array.from(selectedIds);
+    const previousPhotos = photos;
+    const previousTotalPhotos = totalPhotos;
+    pendingTrashTracker.begin(idsToTrash);
+    searchAbortRef.current?.abort();
+    photoRequestGuard.invalidate();
+    const stickyHeaderBottom = document.querySelector('.glass-header')
+      ?.getBoundingClientRect().bottom || 0;
+    const anchor = capturePhotoViewportAnchor(photoGridRef.current, idsToTrash, {
+      viewportTop: stickyHeaderBottom,
+      viewportBottom: window.innerHeight
+    });
+    const optimisticState = createOptimisticTrashState(
+      previousPhotos,
+      idsToTrash,
+      previousTotalPhotos
+    );
+
+    pendingPhotoAnchorRef.current = anchor;
+    setPhotos(optimisticState.photos);
+    setTotalPhotos(optimisticState.totalPhotos);
+    setHasMore(optimisticState.hasMore);
+    setIsConfirmModalOpen(false);
+    setIsSelectMode(false);
+    setSelectedIds(new Set());
+    setIsLoading(false);
     setIsTrashBatchLoading(true);
+    setIsLoadingMore(optimisticState.removedCount > 0 && optimisticState.hasMore);
+
     try {
-      await batchTagTrash(idsToTrash, true);
-
-      // Optimistic UI update
-      setPhotos((prev) =>
-        prev.map((p) => (selectedIds.has(p.id) ? { ...p, is_trashed: 1 } : p))
-      );
-
-      const count = idsToTrash.length;
-      setIsConfirmModalOpen(false);
-      setIsSelectMode(false);
-      setSelectedIds(new Set());
+      const result = await batchTagTrash(idsToTrash, true);
+      const count = result.count ?? idsToTrash.length;
+      pendingTrashTracker.finishMutation(idsToTrash);
       loadStats();
 
       setToastMessage(`Moved ${count} photo${count === 1 ? '' : 's'} to trash`);
       setTimeout(() => setToastMessage(null), 4000);
+      await loadPhotosRef.current?.({
+        isLoadMore: false,
+        targetCount: previousPhotos.length,
+        anchor,
+        anchorFirstPhoto: optimisticState.photos.length === 0,
+        anchorTop: stickyHeaderBottom
+      });
     } catch (err) {
       console.error('Failed to batch trash photos:', err);
-      alert('Failed to move selected photos to trash: ' + err.message);
+      pendingTrashTracker.finishMutation(idsToTrash);
+      await loadPhotosRef.current?.({
+        isLoadMore: false,
+        targetCount: previousPhotos.length,
+        anchor,
+        anchorFirstPhoto: optimisticState.photos.length === 0,
+        anchorTop: stickyHeaderBottom
+      });
+      alert('Could not confirm the trash operation. The library was refreshed where possible.');
     } finally {
       setIsTrashBatchLoading(false);
+      setIsLoadingMore(false);
     }
   };
 
@@ -337,6 +450,7 @@ export default function App() {
         stats={stats}
         onOpenScanModal={() => setIsScanModalOpen(true)}
         onOpenMobileModal={() => setIsMobileModalOpen(true)}
+        onOpenUploadModal={() => setIsUploadModalOpen(true)}
         onRefresh={handleRefreshLibrary}
       />
 
@@ -488,6 +602,7 @@ export default function App() {
 
             {/* Photo Grid */}
             <PhotoGrid
+              gridRef={photoGridRef}
               photos={photos}
               totalPhotos={totalPhotos}
               onSelectPhoto={(photo) => setSelectedPhoto(photo)}
@@ -535,6 +650,10 @@ export default function App() {
             onLibraryUpdated={handleRefreshLibrary}
           />
         )}
+
+        {activeTab === 'documents' && (
+          <DocumentsView />
+        )}
       </main>
 
       {/* Mobile Bottom Navigation Bar (Visible only on small mobile screens) */}
@@ -545,6 +664,14 @@ export default function App() {
         >
           <Sparkles size={20} />
           <span>Photos</span>
+        </button>
+
+        <button
+          className={`mobile-nav-item ${activeTab === 'documents' ? 'active' : ''}`}
+          onClick={() => setActiveTab('documents')}
+        >
+          <FileText size={20} />
+          <span>Docs</span>
         </button>
 
         <button
@@ -632,6 +759,16 @@ export default function App() {
       <MobileConnectModal
         isOpen={isMobileModalOpen}
         onClose={() => setIsMobileModalOpen(false)}
+      />
+
+      {/* Direct Photo Upload Modal */}
+      <UploadModal
+        isOpen={isUploadModalOpen}
+        onClose={() => setIsUploadModalOpen(false)}
+        onUploadComplete={() => {
+          handleRefreshLibrary();
+          loadStats();
+        }}
       />
     </div>
   );

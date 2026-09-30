@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { ShieldAlert, Check, RefreshCw, Sparkles, Image as ImageIcon } from 'lucide-react';
+import { ShieldAlert, Check, RefreshCw, Sparkles, Image as ImageIcon, ExternalLink } from 'lucide-react';
 import { fetchFilteredAssets, reclassifyPhoto } from '../api';
+import RetryImage from './RetryImage';
 
 export default function FilteredView({ onSelectPhoto, onRefreshStats }) {
   const [data, setData] = useState({ screenshots: [], system_assets: [] });
@@ -96,11 +97,10 @@ export default function FilteredView({ onSelectPhoto, onRefreshStats }) {
               onClick={() => onSelectPhoto(item)}
             >
               <div className="photo-card-img-wrap">
-                <img
-                  src={`/api/photos/${item.id}/thumbnail`}
+                <RetryImage
+                  photoId={item.id}
                   alt={item.file_name}
                   className="photo-card-img"
-                  loading="lazy"
                 />
                 <div className="photo-badge-top-left">
                   <span style={{
@@ -117,8 +117,21 @@ export default function FilteredView({ onSelectPhoto, onRefreshStats }) {
               </div>
 
               <div className="photo-card-info">
-                <div className="photo-card-name" title={item.file_name}>
-                  {item.file_name}
+                <div className="photo-card-name-row">
+                  <div className="photo-card-name" title={item.file_name}>
+                    {item.file_name}
+                  </div>
+                  <a
+                    href={`/api/photos/${item.id}/original`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="photo-card-orig-badge"
+                    title={`Open / download original: ${item.file_name}`}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <ExternalLink size={10} />
+                    <span>Orig</span>
+                  </a>
                 </div>
                 <div style={{ fontSize: '0.72rem', color: '#94a3b8', marginBottom: '0.5rem', lineHeight: '1.3' }}>
                   {item.classification_reason || 'Identified as computer image'}

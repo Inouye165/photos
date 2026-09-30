@@ -8,8 +8,11 @@ import os
 import sys
 import threading
 import logging
+import hmac
+import ipaddress
+import secrets
 from typing import Optional, List, Dict, Any, Tuple
-from fastapi import FastAPI, HTTPException, Query, Body, BackgroundTasks, Response
+from fastapi import FastAPI, HTTPException, Query, Body, BackgroundTasks, Request, Response, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -50,6 +53,7 @@ from backend.database import (
     confirm_box,
     reject_box,
     batch_confirm_boxes,
+    confirm_all_pending_boxes,
     get_pending_review_boxes,
     get_unassigned_boxes,
     delete_box,
@@ -58,6 +62,7 @@ from backend.database import (
     DB_PATH
 )
 from backend.scanner import ScanManager
+from backend.photo_repair import PhotoRepairManager
 from backend.thumbnails import get_thumbnail_path, generate_thumbnail
 from backend.vector_engine import VectorEngine
 from backend.deduplicator import run_deduplication_pass, cleanup_duplicate_group
@@ -70,6 +75,7 @@ from backend.face_pet_detector import (
 from backend.backup_worker import BackupWorker
 from backend.gdrive_service import GDriveService
 from backend.database import update_backup_settings, update_photo_gdrive_status, reset_failed_backups
+from backend.metadata_extractor import SUPPORTED_PHOTO_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS
 
 import shutil
 from contextlib import asynccontextmanager
@@ -77,29 +83,45 @@ from contextlib import asynccontextmanager
 # Ensure DB is initialized
 init_db()
 
-def ensure_all_embeddings_in_background():
-    try:
-        conn = get_connection()
-        rows = conn.execute("SELECT id, file_path FROM photos WHERE has_embedding = 0").fetchall()
-        conn.close()
-        if rows:
-            items = [(r["id"], r["file_path"]) for r in rows if os.path.exists(r["file_path"])]
-            if items:
-                VectorEngine.get_instance().batch_index_photos(items, batch_size=16)
-    except Exception as e:
-        print(f"Background embedding error: {e}")
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    threading.Thread(target=ensure_all_embeddings_in_background, daemon=True).start()
+    PhotoRepairManager.get_instance().start()
+    try:
+        from backend.db_backup import ensure_daily_backup
+        threading.Thread(target=ensure_daily_backup, daemon=True).start()
+    except Exception as e:
+        print(f"Error checking daily database backup: {e}")
     try:
         resolve_duplicate_photo_entity_assignments()
     except Exception as e:
         print(f"Error resolving duplicate entity assignments on startup: {e}")
     # Start background Google Drive backup worker
     BackupWorker.get_instance().start()
+    # Start real-time folder watcher (photos)
+    try:
+        from backend.folder_watcher import FolderWatcherManager
+        FolderWatcherManager.get_instance().start()
+    except Exception as e:
+        print(f"Folder watcher start error: {e}")
+    # Start real-time document watcher (isolated from photos)
+    try:
+        from backend.documents_watcher import DocumentWatcherManager
+        DocumentWatcherManager.get_instance().start()
+    except Exception as e:
+        print(f"Document watcher start error: {e}")
     yield
     BackupWorker.get_instance().stop()
+    PhotoRepairManager.get_instance().stop()
+    try:
+        from backend.folder_watcher import FolderWatcherManager
+        FolderWatcherManager.get_instance().stop()
+    except Exception:
+        pass
+    try:
+        from backend.documents_watcher import DocumentWatcherManager
+        DocumentWatcherManager.get_instance().stop()
+    except Exception:
+        pass
 
 app = FastAPI(
     title="LuminaPhoto API",
@@ -108,14 +130,65 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Enable CORS for local development
+_LAN_ACCESS_STATE = {
+    "pairing_token": secrets.token_urlsafe(32),
+    "session_token": secrets.token_urlsafe(32),
+}
+_LAN_SESSION_COOKIE = "lumina_lan_session"
+_LAN_PAIRING_LOCK = threading.Lock()
+MAX_UPLOAD_FILES = 50
+MAX_UPLOAD_FILE_BYTES = 1024 * 1024 * 1024
+MAX_UPLOAD_BATCH_BYTES = 2 * 1024 * 1024 * 1024
+SUPPORTED_UPLOAD_EXTENSIONS = SUPPORTED_PHOTO_EXTENSIONS.union(SUPPORTED_VIDEO_EXTENSIONS)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8500",
+        "http://127.0.0.1:8500",
+        "http://localhost:8765",
+        "http://127.0.0.1:8765",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _is_loopback_client(request: Request) -> bool:
+    """Allows same-machine clients while requiring pairing for LAN clients."""
+    client_host = request.client.host if request.client else ""
+    try:
+        return ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        return client_host == "testclient"
+
+
+@app.middleware("http")
+async def require_lan_pairing(request: Request, call_next):
+    """Protects local APIs from unpaired devices on the home network."""
+    if request.url.path == "/api/photos/upload":
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                request_bytes = int(content_length)
+            except ValueError:
+                return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header"})
+            if request_bytes > MAX_UPLOAD_BATCH_BYTES + 10 * 1024 * 1024:
+                return JSONResponse(status_code=413, content={"detail": "Upload batch exceeds the 2 GiB limit"})
+    if request.url.path.startswith("/api/") and not _is_loopback_client(request):
+        if request.url.path != "/api/access/pair":
+            session_token = request.cookies.get(_LAN_SESSION_COOKIE, "")
+            if not hmac.compare_digest(session_token, _LAN_ACCESS_STATE["session_token"]):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Pair this device using the desktop app's network QR code."},
+                )
+    return await call_next(request)
+
+# Isolated Documents Router (LuminaDocuments)
+from backend.documents_router import router as documents_router
+app.include_router(documents_router)
 
 FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#10b981"/><stop offset="50%" stop-color="#06b6d4"/><stop offset="100%" stop-color="#6366f1"/></linearGradient></defs><rect width="32" height="32" rx="8" fill="#0f172a"/><circle cx="16" cy="17" r="8" fill="none" stroke="url(#g)" stroke-width="2.5"/><circle cx="16" cy="17" r="4" fill="url(#g)"/><circle cx="23" cy="9" r="1.5" fill="#10b981"/><path d="M11 9h3l1.5-2h5l1.5 2h3a2 2 0 0 1 2 2v1a1 1 0 0 1-1 1h-16a1 1 0 0 1-1-1v-1a2 2 0 0 1 2-2z" fill="url(#g)" opacity="0.6"/></svg>"""
 
@@ -193,6 +266,15 @@ class ExchangeCodeRequest(BaseModel):
     state: Optional[str] = None
     redirect_uri: Optional[str] = "http://localhost:8500/api/backup/auth/callback"
 
+class AutostartRequest(BaseModel):
+    enabled: bool
+
+class WatcherToggleRequest(BaseModel):
+    enabled: bool
+
+class PairDeviceRequest(BaseModel):
+    token: str
+
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def get_drive_space_info(target_dir: Optional[str] = None, min_free_gb: float = 5.0):
@@ -238,6 +320,155 @@ def get_drive_space_info(target_dir: Optional[str] = None, min_free_gb: float = 
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "app": "LuminaPhoto"}
+
+@app.get("/api/system/autostart")
+def get_autostart():
+    """Returns whether LuminaPhoto is configured to start on Windows logon."""
+    try:
+        from backend.desktop.autostart import get_autostart_status
+        return get_autostart_status()
+    except Exception as e:
+        return {"enabled": False, "error": str(e), "is_windows": sys.platform == "win32"}
+
+@app.post("/api/system/autostart")
+def toggle_autostart(req: AutostartRequest):
+    """Enables or disables LuminaPhoto startup on Windows logon."""
+    try:
+        from backend.desktop.autostart import set_autostart, get_autostart_status
+        success = set_autostart(req.enabled)
+        status = get_autostart_status()
+        status["success"] = success
+        return status
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/photos/upload")
+async def upload_photos(files: List[UploadFile] = File(...)):
+    """
+    Uploads photo files (e.g. from smartphone on Wi-Fi or desktop drag-and-drop).
+    Saves files to uploads/YYYY-MM/ and indexes them in real-time.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    if len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(status_code=413, detail=f"Upload at most {MAX_UPLOAD_FILES} files at a time")
+
+    import uuid
+    from datetime import datetime
+    from backend.folder_watcher import index_single_photo, FolderWatcherManager
+
+    year_month = datetime.now().strftime("%Y-%m")
+    upload_dir = os.path.join(WORKSPACE_DIR, "uploads", year_month)
+    os.makedirs(upload_dir, exist_ok=True)
+
+    # Ensure watcher tracks the upload directory
+    try:
+        FolderWatcherManager.get_instance().add_watch_path(upload_dir)
+    except Exception:
+        pass
+
+    uploaded_records = []
+    results = []
+    batch_bytes = 0
+    for file_index, file in enumerate(files):
+        if not file.filename:
+            results.append({"file_index": file_index, "filename": "", "status": "failed", "error": "Missing filename"})
+            continue
+        base_name = os.path.basename(file.filename.replace("\\", "/")).strip()
+        extension = os.path.splitext(base_name)[1].lower()
+        if extension not in SUPPORTED_UPLOAD_EXTENSIONS:
+            results.append({"file_index": file_index, "filename": base_name, "status": "failed", "error": "Unsupported file type"})
+            await file.close()
+            continue
+
+        if file.size is not None and file.size > MAX_UPLOAD_FILE_BYTES:
+            results.append({"file_index": file_index, "filename": base_name, "status": "failed", "error": "File exceeds the 1 GiB limit"})
+            await file.close()
+            continue
+
+        dest_path = None
+        temp_path = os.path.join(upload_dir, f".{uuid.uuid4().hex}.upload")
+        file_bytes = 0
+        try:
+            stem = os.path.splitext(base_name)[0]
+            unique_name = f"{stem}_{uuid.uuid4().hex[:8]}{extension}"
+            dest_path = os.path.join(upload_dir, unique_name)
+            with open(temp_path, "xb") as destination:
+                while chunk := await file.read(1024 * 1024):
+                    if file_bytes + len(chunk) > MAX_UPLOAD_FILE_BYTES:
+                        raise ValueError("File exceeds the 1 GiB limit")
+                    if batch_bytes + len(chunk) > MAX_UPLOAD_BATCH_BYTES:
+                        raise ValueError("Upload batch exceeds the 2 GiB limit")
+                    destination.write(chunk)
+                    file_bytes += len(chunk)
+                    batch_bytes += len(chunk)
+
+            if file_bytes == 0:
+                raise ValueError("File is empty")
+
+            os.replace(temp_path, dest_path)
+            photo_id = index_single_photo(dest_path)
+            photo = get_photo_by_id(photo_id) if photo_id else None
+            if not photo:
+                raise ValueError("File was saved but could not be indexed")
+            uploaded_records.append(photo)
+            results.append({"file_index": file_index, "filename": base_name, "status": "uploaded", "photo_id": photo_id, "bytes": file_bytes})
+        except ValueError as exc:
+            results.append({"file_index": file_index, "filename": base_name, "status": "failed", "error": str(exc)})
+            if dest_path and os.path.exists(dest_path):
+                os.remove(dest_path)
+        except Exception:
+            results.append({"file_index": file_index, "filename": base_name, "status": "failed", "error": "Unable to store or index this file"})
+            if dest_path and os.path.exists(dest_path):
+                os.remove(dest_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            await file.close()
+
+    success_count = len(uploaded_records)
+    failed_count = len(results) - success_count
+    return {
+        "status": "partial" if failed_count else "ok",
+        "count": success_count,
+        "failed": failed_count,
+        "uploaded": uploaded_records,
+        "results": results,
+        "destination_dir": upload_dir,
+        "message": f"Uploaded and indexed {success_count} of {len(results)} files"
+    }
+
+@app.get("/api/watcher/status")
+def get_watcher_status():
+    """Returns real-time folder watcher status and metrics."""
+    from backend.folder_watcher import FolderWatcherManager
+    return FolderWatcherManager.get_instance().get_status()
+
+@app.post("/api/watcher/toggle")
+def toggle_watcher(req: WatcherToggleRequest):
+    """Enables or disables real-time folder watching."""
+    from backend.folder_watcher import FolderWatcherManager
+    mgr = FolderWatcherManager.get_instance()
+    if req.enabled:
+        mgr.start()
+    else:
+        mgr.stop()
+    return mgr.get_status()
+
+@app.get("/api/system/database-backup/status")
+def get_db_backup_status():
+    """Returns database backup status and snapshot history."""
+    from backend.db_backup import get_backup_status
+    return get_backup_status()
+
+@app.post("/api/system/database-backup")
+def trigger_database_backup():
+    """Triggers an immediate hot snapshot of photos.db."""
+    from backend.db_backup import create_database_backup
+    try:
+        return create_database_backup()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/default-path")
 def get_default_path():
@@ -316,6 +547,18 @@ def get_scan_status():
     """Returns real-time scan progress and counters."""
     manager = ScanManager.get_instance()
     return manager.get_status()
+
+@app.post("/api/catalog/repair")
+def start_catalog_repair():
+    """Starts repair of legacy photo records with incomplete image metadata."""
+    manager = PhotoRepairManager.get_instance()
+    started = manager.start()
+    return {"started": started, **manager.get_status()}
+
+@app.get("/api/catalog/repair/status")
+def get_catalog_repair_status():
+    """Returns background catalog repair progress and outcomes."""
+    return PhotoRepairManager.get_instance().get_status()
 
 @app.post("/api/deduplicate/refresh")
 def refresh_duplicates():
@@ -500,10 +743,10 @@ IMMUTABLE_CACHE_HEADERS = {
 }
 
 @app.get("/api/photos/{photo_id}/thumbnail")
-def get_photo_thumbnail(photo_id: int):
+def get_photo_thumbnail(photo_id: int, refresh: bool = False):
     """Serves the cached WebP micro-thumbnail with high-speed disk fast-path and HTTP caching."""
     thumb_path = get_thumbnail_path(photo_id, "thumb")
-    if os.path.exists(thumb_path):
+    if os.path.exists(thumb_path) and not refresh:
         return FileResponse(thumb_path, media_type="image/webp", headers=IMMUTABLE_CACHE_HEADERS)
 
     photo = get_photo_by_id(photo_id)
@@ -511,7 +754,7 @@ def get_photo_thumbnail(photo_id: int):
         raise HTTPException(status_code=404, detail="Photo not found")
 
     if os.path.exists(photo["file_path"]):
-        generated = generate_thumbnail(photo["file_path"], photo_id, "thumb")
+        generated = generate_thumbnail(photo["file_path"], photo_id, "thumb", force=refresh)
         if generated and os.path.exists(generated):
             return FileResponse(generated, media_type="image/webp", headers=IMMUTABLE_CACHE_HEADERS)
         return FileResponse(photo["file_path"], headers={"Cache-Control": "public, max-age=86400"})
@@ -539,17 +782,38 @@ def get_photo_preview(photo_id: int):
     raise HTTPException(status_code=404, detail="Preview not available")
 
 @app.get("/api/photos/{photo_id}/original")
-def get_photo_original(photo_id: int):
+def get_photo_original(photo_id: int, download: bool = False):
     """Serves the pristine original photo file (read-only)."""
     photo = get_photo_by_id(photo_id)
     if not photo or not os.path.exists(photo["file_path"]):
         raise HTTPException(status_code=404, detail="Original photo file not found on disk")
 
+    import mimetypes
+    media_type, _ = mimetypes.guess_type(photo["file_path"])
+    if not media_type:
+        media_type = "application/octet-stream"
+
     return FileResponse(
         photo["file_path"],
-        filename=photo["file_name"],
-        media_type="application/octet-stream"
+        filename=photo["file_name"] if download else None,
+        content_disposition_type="attachment" if download else "inline",
+        media_type=media_type
     )
+
+@app.post("/api/photos/{photo_id}/reveal")
+def reveal_photo_in_file_explorer(photo_id: int):
+    """Opens Windows Explorer with the photo file selected."""
+    photo = get_photo_by_id(photo_id)
+    if not photo or not os.path.exists(photo["file_path"]):
+        raise HTTPException(status_code=404, detail="Photo file not found on disk")
+
+    try:
+        import subprocess
+        norm_path = os.path.normpath(photo["file_path"])
+        subprocess.Popen(f'explorer /select,"{norm_path}"')
+        return {"success": True, "message": "Revealed in File Explorer"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/photos/{photo_id}/full")
 def get_photo_full(photo_id: int):
@@ -613,10 +877,13 @@ def get_local_ip_addresses():
 
 @app.get("/api/network-info")
 def get_network_info():
-    """Returns local network IP addresses for home Wi-Fi and mobile phone access."""
+    """Returns one-time pairing URLs for devices on the home network."""
     port = 8500
     ips = get_local_ip_addresses()
-    urls = [f"http://{ip}:{port}" for ip in ips]
+    with _LAN_PAIRING_LOCK:
+        _LAN_ACCESS_STATE["pairing_token"] = secrets.token_urlsafe(32)
+        pairing_token = _LAN_ACCESS_STATE["pairing_token"]
+    urls = [f"http://{ip}:{port}/api/access/pair#{pairing_token}" for ip in ips]
     return {
         "hostname": socket.gethostname(),
         "port": port,
@@ -624,6 +891,37 @@ def get_network_info():
         "primary_url": urls[0],
         "all_urls": urls
     }
+
+@app.get("/api/access/pair", response_class=HTMLResponse)
+def show_pairing_page():
+    """Exchanges the QR fragment token for an HttpOnly browser session."""
+    return HTMLResponse("""<!doctype html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pair LuminaPhoto</title></head>
+<body><p id="status">Connecting this device to LuminaPhoto...</p>
+<script>
+const token = decodeURIComponent(location.hash.slice(1));
+fetch('/api/access/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
+  .then(response => { if (!response.ok) throw new Error('This pairing link has expired. Reopen the QR code on your computer.'); location.replace('/'); })
+  .catch(error => { document.getElementById('status').textContent = error.message; });
+</script></body></html>""")
+
+@app.post("/api/access/pair")
+def pair_lan_device(req: PairDeviceRequest, response: Response):
+    """Redeems a one-time LAN pairing token and sets a browser session cookie."""
+    with _LAN_PAIRING_LOCK:
+        if not hmac.compare_digest(req.token, _LAN_ACCESS_STATE["pairing_token"]):
+            raise HTTPException(status_code=403, detail="Invalid or expired pairing link")
+        _LAN_ACCESS_STATE["pairing_token"] = secrets.token_urlsafe(32)
+    response.set_cookie(
+        key=_LAN_SESSION_COOKIE,
+        value=_LAN_ACCESS_STATE["session_token"],
+        max_age=7 * 24 * 60 * 60,
+        httponly=True,
+        samesite="strict",
+        secure=False,
+        path="/",
+    )
+    return {"paired": True}
 
 @app.delete("/api/photos/{photo_id}")
 def delete_photo(photo_id: int, permanent: bool = False):
@@ -1433,6 +1731,12 @@ def get_pending_reviews(
         "limit": limit,
         "offset": offset
     }
+
+@app.post("/api/people-pets/pending/confirm-all")
+def confirm_all_pending_reviews():
+    """Confirms the complete pending suggestion queue atomically."""
+    confirmed_count = confirm_all_pending_boxes()
+    return {"confirmed_count": confirmed_count}
 
 def cleanup_redundant_boxes(photo_id: int, target_box_id: int):
     """

@@ -7,17 +7,14 @@ Leaves original files completely untouched.
 import os
 import hashlib
 import json
+import logging
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
 from PIL import Image, ExifTags
 import imagehash
+from backend.image_loader import open_image_with_retry
 
-# Register HEIF opener for Apple iOS photos if available
-try:
-    import pillow_heif
-    pillow_heif.register_heif_opener()
-except Exception:
-    pass
+logger = logging.getLogger(__name__)
 
 # Supported photo and video extensions
 SUPPORTED_PHOTO_EXTENSIONS = {
@@ -171,7 +168,7 @@ def extract_metadata(file_path: str) -> Dict[str, Any]:
         return result
 
     try:
-        with Image.open(file_path) as img:
+        with open_image_with_retry(file_path) as img:
             width, height = img.size
             result["width"] = width
             result["height"] = height
@@ -302,9 +299,10 @@ def extract_metadata(file_path: str) -> Dict[str, Any]:
 
             result["raw_exif_json"] = json.dumps(raw_exif_dict)
 
-    except Exception as e:
-        # If Pillow fails on special RAW or unhandled format, preserve basic file info
-        pass
+    except Exception as exc:
+        if result["width"] is None or result["height"] is None:
+            result["format"] = "UNREADABLE"
+        logger.warning("Could not fully read image metadata for %s: %s", file_path, exc, exc_info=True)
 
     # Fallback for date_taken if not in EXIF
     if not result["date_taken"]:

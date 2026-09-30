@@ -13,7 +13,8 @@ import {
   ShieldAlert,
   ArrowRight,
   History,
-  X
+  X,
+  ExternalLink
 } from 'lucide-react';
 import {
   fetchTrash,
@@ -25,6 +26,7 @@ import {
   purgeTrashForSpace,
   fetchPurgeLogs
 } from '../api';
+import RetryImage from './RetryImage';
 
 export default function TrashView({ onSelectPhoto, onLibraryUpdated }) {
   const [trashedPhotos, setTrashedPhotos] = useState([]);
@@ -373,7 +375,6 @@ export default function TrashView({ onSelectPhoto, onLibraryUpdated }) {
         ) : (
           <div className="photo-grid">
             {trashedPhotos.map((photo) => {
-              const thumbUrl = `/api/photos/${photo.id}/thumbnail`;
               return (
                 <div
                   key={photo.id}
@@ -381,14 +382,10 @@ export default function TrashView({ onSelectPhoto, onLibraryUpdated }) {
                   onClick={() => onSelectPhoto(photo)}
                 >
                   <div className="photo-card-img-wrap">
-                    <img
-                      src={thumbUrl}
+                    <RetryImage
+                      photoId={photo.id}
                       alt={photo.file_name}
                       className="photo-card-img"
-                      loading="lazy"
-                      onError={(e) => {
-                        e.target.style.display = 'none';
-                      }}
                     />
 
                     {/* Quick restore button */}
@@ -409,8 +406,21 @@ export default function TrashView({ onSelectPhoto, onLibraryUpdated }) {
                   </div>
 
                   <div className="photo-card-info">
-                    <div className="photo-card-name" title={photo.file_name}>
-                      {photo.file_name}
+                    <div className="photo-card-name-row">
+                      <div className="photo-card-name" title={photo.file_name}>
+                        {photo.file_name}
+                      </div>
+                      <a
+                        href={`/api/photos/${photo.id}/original`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="photo-card-orig-badge"
+                        title={`Open / download original: ${photo.file_name}`}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <ExternalLink size={10} />
+                        <span>Orig</span>
+                      </a>
                     </div>
                     <div className="photo-card-meta">
                       <span>{formatMb(photo.file_size)}</span>

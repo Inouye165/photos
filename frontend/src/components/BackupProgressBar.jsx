@@ -44,14 +44,16 @@ export default function BackupProgressBar() {
   const [editLimit, setEditLimit] = useState(25);
   const [editDelay, setEditDelay] = useState(30);
   const popoverRef = useRef(null);
+  const hasInitializedInputs = useRef(false);
 
   const loadStatus = async () => {
     try {
       const data = await fetchBackupStatus();
       setState(data);
-      if (data) {
+      if (data && !hasInitializedInputs.current) {
         setEditLimit(data.hourly_limit || 25);
         setEditDelay(data.delay_seconds || 30);
+        hasInitializedInputs.current = true;
       }
       return data;
     } catch (err) {
@@ -71,14 +73,11 @@ export default function BackupProgressBar() {
     }
   }, []);
 
+  // Live polling: refresh status every 2.5s when popover open, every 8s in background
   useEffect(() => {
     loadStatus();
-  }, []);
-
-  useEffect(() => {
-    if (isOpen) {
-      loadStatus();
-    }
+    const interval = setInterval(loadStatus, isOpen ? 2500 : 8000);
+    return () => clearInterval(interval);
   }, [isOpen]);
 
   // Close popover on outside click
@@ -219,10 +218,15 @@ export default function BackupProgressBar() {
     e.preventDefault();
     setIsUpdating(true);
     try {
-      await updateBackupSettings({
+      const updated = await updateBackupSettings({
         hourly_limit: parseInt(editLimit, 10),
         delay_seconds: parseFloat(editDelay)
       });
+      if (updated) {
+        setEditLimit(updated.hourly_limit);
+        setEditDelay(updated.delay_seconds);
+        hasInitializedInputs.current = true;
+      }
       await loadStatus();
     } finally {
       setIsUpdating(false);
@@ -266,6 +270,9 @@ export default function BackupProgressBar() {
   } else if (backedUp >= total && total > 0) {
     statusIcon = <CloudCheck size={14} style={{ color: '#10b981' }} />;
     statusText = 'Backed Up';
+  } else if (stats?.pending_count > 0) {
+    statusIcon = <Cloud size={14} style={{ color: '#38bdf8' }} />;
+    statusText = `Pacing (${backedUp.toLocaleString()} / ${total.toLocaleString()})`;
   } else {
     statusIcon = <Cloud size={14} style={{ color: '#38bdf8' }} />;
     statusText = `${backedUp.toLocaleString()} / ${total.toLocaleString()}`;
@@ -675,8 +682,16 @@ export default function BackupProgressBar() {
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
                   <span style={{ color: '#94a3b8' }}>Status</span>
-                  <span style={{ fontWeight: 600, color: is_paused ? '#f59e0b' : '#38bdf8' }}>
-                    {is_paused ? 'Paused' : status === 'uploading' ? 'Syncing...' : status === 'throttled' ? 'Throttled (Hourly Cap)' : 'Idle'}
+                  <span style={{ fontWeight: 600, color: is_paused ? '#f59e0b' : status === 'uploading' ? '#06b6d4' : status === 'throttled' ? '#a855f7' : (stats?.pending_count > 0 ? '#38bdf8' : '#10b981') }}>
+                    {is_paused
+                      ? 'Paused'
+                      : status === 'uploading'
+                      ? 'Uploading photo...'
+                      : status === 'throttled'
+                      ? 'Throttled (Hourly Cap Reached)'
+                      : stats?.pending_count > 0
+                      ? `Pacing (${state.delay_seconds || 30}s spacing delay)`
+                      : 'All Photos Backed Up'}
                   </span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
@@ -685,20 +700,35 @@ export default function BackupProgressBar() {
                     {backedUp.toLocaleString()} / {total.toLocaleString()} ({pct}%)
                   </span>
                 </div>
+                {stats?.pending_count > 0 && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                    <span style={{ color: '#94a3b8' }}>Remaining</span>
+                    <span style={{ fontWeight: 500, color: '#cbd5e1' }}>
+                      {stats.pending_count.toLocaleString()} photos
+                    </span>
+                  </div>
+                )}
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
                   <span style={{ color: '#94a3b8' }}>This Hour</span>
                   <span style={{ fontWeight: 500, color: '#f8fafc' }}>
                     {uploads_this_hour} / {hourly_limit} max
                   </span>
                 </div>
-                {current_file && (
+                {current_file ? (
                   <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
-                    <span style={{ fontSize: '11px', color: '#94a3b8' }}>Current file:</span>
+                    <span style={{ fontSize: '11px', color: '#94a3b8' }}>Current upload:</span>
                     <div style={{ fontSize: '12px', color: '#38bdf8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {current_file}
                     </div>
                   </div>
-                )}
+                ) : state.status_message ? (
+                  <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+                    <span style={{ fontSize: '11px', color: '#94a3b8' }}>Last completed:</span>
+                    <div style={{ fontSize: '12px', color: '#94a3b8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {state.status_message}
+                    </div>
+                  </div>
+                ) : null}
               </div>
 
               {/* Action Controls */}
@@ -761,7 +791,7 @@ export default function BackupProgressBar() {
                     <input
                       type="number"
                       min="5"
-                      max="100"
+                      max="2000"
                       value={editLimit}
                       onChange={(e) => setEditLimit(e.target.value)}
                       style={{
@@ -779,7 +809,7 @@ export default function BackupProgressBar() {
                     <label style={{ fontSize: '11px', color: '#64748b', display: 'block', marginBottom: '2px' }}>Delay (sec)</label>
                     <input
                       type="number"
-                      min="5"
+                      min="1"
                       max="300"
                       value={editDelay}
                       onChange={(e) => setEditDelay(e.target.value)}

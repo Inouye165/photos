@@ -3,7 +3,14 @@
 backend/photos.db
 backend/photos.db-wal
 backend/photos.db-shm
+backend/documents.db
+backend/documents.db-wal
+backend/documents.db-shm
 *.db
+
+# Document Storage & Trash Holding Folder
+documents_library/
+documents_trash/
 
 # Python
 __pycache__/

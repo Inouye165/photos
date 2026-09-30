@@ -7,9 +7,12 @@ LuminaPhoto is a privacy-first, local-first intelligent photo management system.
 ## 🚀 Key Features
 
 * **Smart Classification:** Automatically distinguishes authentic camera photos from screenshots, web graphics, and icons using hardware EXIF data and aspect-ratio heuristics.
+* **Real-Time Folder Watching:** Automatically detects and catalogs new photos added to library folders or imported from SD cards in the background.
+* **Mobile Wi-Fi Direct Upload:** Easily upload pictures from your smartphone camera roll directly over your home Wi-Fi into your catalog.
 * **People & Pets Detection:** Local on-device detection using YuNet face detection and YOLOv8 pet detection to group and label family, friends, and pets.
 * **Duplicate Detection:** Perceptual hash (dHash/pHash) and visual similarity analysis to safely declutter your photo collection.
 * **Semantic & Natural Language Search:** Search your library naturally (e.g., *"golden retriever in the snow"* or *"sunset on the beach"*).
+* **Automated Database Snapshots:** Crash-safe, lock-free SQLite hot backups with rolling snapshot retention.
 * **Conservative Cloud Backup:** Background, rate-limited backup to your own personal Google Drive organized into clean `Year/Month` folders without freezing your connection.
 
 ---
@@ -60,15 +63,28 @@ cd ..
 ```
 
 ### 4. Start the Application
-Run the startup script:
-```powershell
-.\start.ps1
-```
-Or start each service manually:
-* **Backend:** `python -m uvicorn backend.app:app --host 127.0.0.1 --port 8500 --reload`
-* **Frontend:** `cd frontend && npm run dev`
 
-Open your browser to: **http://localhost:5173**
+* **Native Desktop App & System Tray (Recommended):**
+  Set up shortcuts and desktop dependencies:
+  ```powershell
+  .\setup_desktop.ps1
+  ```
+  Or run directly:
+  ```powershell
+  python start_desktop.py
+  ```
+  * Double-click the newly created **LuminaPhoto** desktop shortcut to run silently in the background with zero terminal clutter.
+  * Right-click the camera icon in your **Windows System Tray** to open the app, toggle auto-start on logon, or view local Wi-Fi URLs for phone access.
+
+* **Browser-Only Mode:**
+  ```powershell
+  .\start.ps1
+  ```
+
+* **Silent Background / Windows Boot Mode:**
+  ```powershell
+  python start_desktop.py --minimized
+  ```
 
 ---
 
@@ -144,19 +160,29 @@ photos/
 ├── backend/
 │   ├── app.py                 # FastAPI REST API endpoints
 │   ├── database.py            # SQLite schema, indexing, migrations
+│   ├── folder_watcher.py      # Real-time directory watcher & incremental indexer (watchdog)
+│   ├── db_backup.py           # SQLite online hot backup & snapshot rotation
 │   ├── backup_worker.py       # Background sync worker thread & rate limiting
 │   ├── gdrive_auth.py         # Google OAuth 2.0 flow & token management
 │   ├── gdrive_service.py      # Google Drive folder hierarchy & upload client
 │   ├── classifier.py          # EXIF & camera authentic photo classifier
 │   ├── face_pet_detector.py   # Facial recognition & pet detection pipeline
 │   ├── deduplicator.py        # Perceptual hash & exact duplicate detection
-│   └── test_backup.py         # Google Drive backup test suite
+│   └── desktop/               # Windows desktop integration
+│       ├── tray.py            # System Tray icon & context menu (pystray)
+│       ├── autostart.py       # Windows Registry logon manager (HKCU Run)
+│       ├── window.py          # Native WebView2 application window (pywebview)
+│       └── icon.py            # Dynamic Lumina brand icon generator
 ├── frontend/
 │   ├── src/
 │   │   ├── components/        # React UI components (Gallery, Backup, Lightbox)
 │   │   ├── api.js             # Client API service
 │   │   └── App.jsx            # Main app shell
 │   └── package.json
+├── start_desktop.py           # Unified Desktop & System Tray application runner
+├── setup_desktop.ps1          # One-click desktop & start menu shortcut installer
+├── LuminaPhoto.bat            # Double-click desktop batch launcher
+├── LuminaPhoto.vbs            # Silent launcher without command prompt flash
 └── README.md                  # Project documentation & setup instructions
 ```
 
