@@ -6,17 +6,22 @@ and live folder scanning progress.
 
 import os
 import sys
+import time
+import html
+import socket
+import tempfile
 import threading
 import logging
 import hmac
 import ipaddress
 import secrets
+from urllib.parse import urlparse
 from typing import Optional, List, Dict, Any, Tuple
 from fastapi import FastAPI, HTTPException, Query, Body, BackgroundTasks, Request, Response, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class EndpointFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -43,6 +48,7 @@ from backend.database import (
     get_or_create_entity,
     list_entities,
     get_entity_by_id,
+    get_photo_tag_scores_for_entities,
     update_entity,
     delete_entity,
     insert_detected_box,
@@ -74,7 +80,14 @@ from backend.face_pet_detector import (
 )
 from backend.backup_worker import BackupWorker
 from backend.gdrive_service import GDriveService
-from backend.database import update_backup_settings, update_photo_gdrive_status, reset_failed_backups
+from backend.database import (
+    update_backup_settings,
+    update_photo_gdrive_status,
+    reset_failed_backups,
+    enqueue_gdrive_permanent_delete,
+    remove_pending_gdrive_delete,
+    repair_entity_avatars
+)
 from backend.metadata_extractor import SUPPORTED_PHOTO_EXTENSIONS, SUPPORTED_VIDEO_EXTENSIONS
 
 import shutil
@@ -93,8 +106,19 @@ async def lifespan(app: FastAPI):
         print(f"Error checking daily database backup: {e}")
     try:
         resolve_duplicate_photo_entity_assignments()
+        repair_entity_avatars()
     except Exception as e:
         print(f"Error resolving duplicate entity assignments on startup: {e}")
+    try:
+        def _startup_embedding_sync():
+            try:
+                VectorEngine.get_instance().sync_with_db()
+                ScanManager.get_instance().start_embedding_backfill()
+            except Exception as sync_err:
+                print(f"Background embedding sync error: {sync_err}")
+        threading.Thread(target=_startup_embedding_sync, daemon=True).start()
+    except Exception as e:
+        print(f"Error starting background embedding sync: {e}")
     # Start background Google Drive backup worker
     BackupWorker.get_instance().start()
     # Start real-time folder watcher (photos)
@@ -132,10 +156,12 @@ app = FastAPI(
 
 _LAN_ACCESS_STATE = {
     "pairing_token": secrets.token_urlsafe(32),
+    "pairing_expires_at": time.time() + 300,
     "session_token": secrets.token_urlsafe(32),
 }
 _LAN_SESSION_COOKIE = "lumina_lan_session"
 _LAN_PAIRING_LOCK = threading.Lock()
+_PAIRING_TTL_SECONDS = 300
 MAX_UPLOAD_FILES = 50
 MAX_UPLOAD_FILE_BYTES = 1024 * 1024 * 1024
 MAX_UPLOAD_BATCH_BYTES = 2 * 1024 * 1024 * 1024
@@ -164,9 +190,64 @@ def _is_loopback_client(request: Request) -> bool:
         return client_host == "testclient"
 
 
+def _require_loopback_client(request: Request):
+    """Raises 403 if the request did not originate from the local host."""
+    if not _is_loopback_client(request):
+        raise HTTPException(status_code=403, detail="This action is restricted to the local computer.")
+
+
+def _extract_hostname(host_value: str) -> str:
+    """Extracts the bare hostname or IP literal from a Host header or URL netloc."""
+    raw = host_value.strip().lower()
+    if not raw:
+        return ""
+    if raw.startswith("["):
+        end_bracket = raw.find("]")
+        if end_bracket != -1:
+            return raw[1:end_bracket]
+    if ":" in raw and raw.count(":") == 1:
+        return raw.split(":", 1)[0]
+    return raw
+
+
+def _is_trusted_hostname(hostname: str) -> bool:
+    """Validates hostname against localhost, local machine name, or IP literal to block DNS rebinding."""
+    clean = _extract_hostname(hostname)
+    if not clean:
+        return False
+    allowed_names = {"localhost", "127.0.0.1", "::1", "testserver", "testclient"}
+    try:
+        allowed_names.add(socket.gethostname().lower())
+    except Exception:
+        pass
+    if clean in allowed_names:
+        return True
+    try:
+        ipaddress.ip_address(clean)
+        return True
+    except ValueError:
+        return False
+
+
 @app.middleware("http")
 async def require_lan_pairing(request: Request, call_next):
-    """Protects local APIs from unpaired devices on the home network."""
+    """Protects local APIs from unpaired devices, DNS rebinding, and cross-site request forgery."""
+    host_header = request.headers.get("host", "")
+    if host_header and not _is_trusted_hostname(host_header):
+        return JSONResponse(status_code=403, content={"detail": "Untrusted Host header"})
+
+    if request.method in {"POST", "PUT", "DELETE", "PATCH"}:
+        sec_fetch_site = request.headers.get("sec-fetch-site", "").lower()
+        if sec_fetch_site == "cross-site":
+            return JSONResponse(status_code=403, content={"detail": "Cross-site requests are forbidden"})
+        origin = request.headers.get("origin")
+        if origin:
+            if origin.strip().lower() == "null":
+                return JSONResponse(status_code=403, content={"detail": "Untrusted Origin header"})
+            parsed_origin = urlparse(origin)
+            if not parsed_origin.hostname or not _is_trusted_hostname(parsed_origin.hostname):
+                return JSONResponse(status_code=403, content={"detail": "Untrusted Origin header"})
+
     if request.url.path == "/api/photos/upload":
         content_length = request.headers.get("content-length")
         if content_length:
@@ -211,7 +292,7 @@ class TrashToggleRequest(BaseModel):
     is_trashed: bool = True
 
 class BatchTrashRequest(BaseModel):
-    photo_ids: List[int]
+    photo_ids: List[int] = Field(..., max_length=1000)
     is_trashed: bool = True
 
 class PurgeSpaceRequest(BaseModel):
@@ -253,7 +334,7 @@ class AssignBoxRequest(BaseModel):
     set_as_avatar: Optional[bool] = True
 
 class BatchConfirmRequest(BaseModel):
-    box_ids: List[int]
+    box_ids: List[int] = Field(..., max_length=1000)
 
 class BackupSettingsRequest(BaseModel):
     hourly_limit: Optional[int] = None
@@ -265,6 +346,12 @@ class ExchangeCodeRequest(BaseModel):
     code: str
     state: Optional[str] = None
     redirect_uri: Optional[str] = "http://localhost:8500/api/backup/auth/callback"
+
+class SyncNowRequest(BaseModel):
+    retry_failed: bool = False
+
+class UploadCredentialsRequest(BaseModel):
+    credentials_json: str
 
 class AutostartRequest(BaseModel):
     enabled: bool
@@ -322,8 +409,9 @@ def health_check():
     return {"status": "ok", "app": "LuminaPhoto"}
 
 @app.get("/api/system/autostart")
-def get_autostart():
+def get_autostart(request: Request):
     """Returns whether LuminaPhoto is configured to start on Windows logon."""
+    _require_loopback_client(request)
     try:
         from backend.desktop.autostart import get_autostart_status
         return get_autostart_status()
@@ -331,8 +419,9 @@ def get_autostart():
         return {"enabled": False, "error": str(e), "is_windows": sys.platform == "win32"}
 
 @app.post("/api/system/autostart")
-def toggle_autostart(req: AutostartRequest):
+def toggle_autostart(req: AutostartRequest, request: Request):
     """Enables or disables LuminaPhoto startup on Windows logon."""
+    _require_loopback_client(request)
     try:
         from backend.desktop.autostart import set_autostart, get_autostart_status
         success = set_autostart(req.enabled)
@@ -428,6 +517,8 @@ async def upload_photos(files: List[UploadFile] = File(...)):
 
     success_count = len(uploaded_records)
     failed_count = len(results) - success_count
+    if success_count > 0:
+        BackupWorker.get_instance().trigger_wake()
     return {
         "status": "partial" if failed_count else "ok",
         "count": success_count,
@@ -484,20 +575,74 @@ def get_default_path():
         "pictures": pictures_dir
     }
 
+def _is_allowed_photo_directory(target_path: str) -> bool:
+    """Validates that a photo browse/scan path is a local non-UNC directory within user or workspace roots."""
+    if not target_path or not isinstance(target_path, str):
+        return False
+    stripped = target_path.strip()
+    if stripped.startswith("\\\\") or stripped.startswith("//"):
+        return False
+    try:
+        real_target = os.path.realpath(os.path.abspath(stripped))
+    except Exception:
+        return False
+
+    # Reject Windows OS and program directories explicitly
+    forbidden_roots = [
+        os.environ.get("SystemRoot", r"C:\Windows"),
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        os.environ.get("ProgramData", r"C:\ProgramData"),
+    ]
+    for f_root in forbidden_roots:
+        if f_root:
+            try:
+                real_f = os.path.realpath(f_root)
+                if os.path.commonpath([real_f, real_target]) == real_f:
+                    return False
+            except ValueError:
+                pass
+
+    allowed_roots = [
+        os.path.expanduser("~"),
+        WORKSPACE_DIR,
+        tempfile.gettempdir(),
+    ]
+    for a_root in allowed_roots:
+        if a_root:
+            try:
+                real_a = os.path.realpath(a_root)
+                if os.path.commonpath([real_a, real_target]) == real_a:
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
 @app.get("/api/browse-folders")
-def browse_folders(path: Optional[str] = None):
+def browse_folders(request: Request, path: Optional[str] = None):
     """Lists subdirectories within a given path for folder & subfolder browsing."""
-    target_path = path.strip() if path and path.strip() else WORKSPACE_DIR
+    _require_loopback_client(request)
+    if path and path.strip():
+        raw_target = path.strip()
+        if not _is_allowed_photo_directory(raw_target):
+            raise HTTPException(status_code=403, detail="Forbidden: Directory is outside allowed user folders")
+        target_path = raw_target
+    else:
+        target_path = WORKSPACE_DIR
+
     if not os.path.exists(target_path) or not os.path.isdir(target_path):
         target_path = os.path.expanduser("~")
         
     subfolders = []
-    parent = os.path.dirname(os.path.abspath(target_path)) if target_path != os.path.dirname(os.path.abspath(target_path)) else None
+    abs_target = os.path.abspath(target_path)
+    parent_candidate = os.path.dirname(abs_target)
+    parent = parent_candidate if parent_candidate != abs_target and _is_allowed_photo_directory(parent_candidate) else None
     
     try:
         with os.scandir(target_path) as it:
             for entry in it:
-                if entry.is_dir() and not entry.name.startswith(('.', '$')) and entry.name not in ('node_modules', '.git', '.lumina_cache', 'venv', '__pycache__'):
+                if entry.is_dir() and not entry.name.startswith(('.', '$')) and entry.name not in ('node_modules', '.git', '.lumina_cache', 'venv', '__pycache__', 'AppData'):
                     subfolders.append({
                         "name": entry.name,
                         "path": entry.path
@@ -508,7 +653,7 @@ def browse_folders(path: Optional[str] = None):
     subfolders.sort(key=lambda x: x["name"].lower())
     
     return {
-        "current_path": os.path.abspath(target_path),
+        "current_path": abs_target,
         "parent_path": parent,
         "subfolders": subfolders
     }
@@ -526,8 +671,11 @@ def clear_catalog():
     return {"message": "Catalog cleared successfully."}
 
 @app.post("/api/scan/start")
-def start_scan(req: ScanRequest):
+def start_scan(req: ScanRequest, request: Request):
     """Starts recursive indexing of a folder and its subfolders."""
+    _require_loopback_client(request)
+    if not _is_allowed_photo_directory(req.path):
+        raise HTTPException(status_code=403, detail="Forbidden: Scan path must be within your user profile or workspace directory")
     manager = ScanManager.get_instance()
     success = manager.start_scan(req.path)
     if not success:
@@ -596,17 +744,87 @@ def list_photos(
     if query and query.strip():
         # 1. Parse natural language intent, entities, dates, and visual prompt
         known_folders = get_known_entity_folders()
-        parser = QueryParser(known_folders=known_folders)
+        known_entities = list_entities()
+        parser = QueryParser(known_folders=known_folders, known_entities=known_entities)
         parsed = parser.parse(query.strip())
-        
+
+        target_entity_ids = list(parsed.entity_ids)
+        if entity_id is not None and int(entity_id) not in target_entity_ids:
+            target_entity_ids.append(int(entity_id))
+
+        entity_photo_scores = get_photo_tag_scores_for_entities(target_entity_ids) if target_entity_ids else {}
+
         target_class = clean_class if clean_class else parsed.classification
+        # When filtering by a tagged person/pet, do not exclude their tagged photos by default classification unless SCREENSHOT was requested
+        if entity_photo_scores and not clean_class and parsed.classification != "SCREENSHOT":
+            target_class = "ALL"
 
         # 2. Check if there are explicit or parsed metadata constraints
         has_temporal_constraints = bool(parsed.date_from or parsed.date_to or clean_year)
         has_metadata_constraints = bool(clean_camera or (clean_gps is not None) or (target_class and target_class != "ALL"))
 
-        allowed_candidate_ids = None
+        allowed_candidate_ids = set(entity_photo_scores.keys()) if entity_photo_scores else None
         date_fallback_applied = False
+
+        # 2a. Pure entity search (e.g. "Ron", "photos of Ron", "Sarah in 2024") without extra visual scene description
+        if entity_photo_scores and not parsed.has_visual_scene:
+            tagged_ids = list(entity_photo_scores.keys())
+            matched_photos, _ = get_photos(
+                classification=target_class,
+                include_duplicates=include_duplicates,
+                date_from=parsed.date_from,
+                date_to=parsed.date_to,
+                year=clean_year,
+                camera_make=clean_camera,
+                has_gps=clean_gps,
+                photo_ids=tagged_ids,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                is_trashed=None if include_trashed else False,
+                limit=max(len(tagged_ids), 1),
+                offset=0
+            )
+            if not matched_photos and has_temporal_constraints:
+                date_fallback_applied = True
+                matched_photos, _ = get_photos(
+                    classification=target_class,
+                    include_duplicates=include_duplicates,
+                    year=clean_year,
+                    camera_make=clean_camera,
+                    has_gps=clean_gps,
+                    photo_ids=tagged_ids,
+                    sort_by=sort_by,
+                    sort_order=sort_order,
+                    is_trashed=None if include_trashed else False,
+                    limit=max(len(tagged_ids), 1),
+                    offset=0
+                )
+
+            for p in matched_photos:
+                p["similarity_score"] = round(entity_photo_scores.get(p["id"], 0.9), 4)
+
+            # Sort confirmed tags ahead of pending tags while preserving date/requested sort order within each tier
+            matched_photos.sort(key=lambda x: x.get("similarity_score", 0.0), reverse=True)
+            paged_photos = matched_photos[actual_offset:actual_offset + actual_limit]
+
+            parsed_dict = parsed.to_dict()
+            parsed_dict["fallback_applied"] = date_fallback_applied
+            if date_fallback_applied:
+                period_name = parsed.date_label or "the specified period"
+                ent_names = ", ".join(e.get("name", "") for e in parsed.entities if e.get("name")) or query.strip()
+                parsed_dict["fallback_message"] = (
+                    f"No photos of '{ent_names}' found in {period_name}. "
+                    f"Showing all tagged photos across your library."
+                )
+
+            return {
+                "photos": paged_photos,
+                "total": len(matched_photos),
+                "offset": actual_offset,
+                "limit": actual_limit,
+                "query": query,
+                "parsed_query": parsed_dict
+            }
 
         if has_temporal_constraints or has_metadata_constraints:
             matched_photos, _ = get_photos(
@@ -616,6 +834,7 @@ def list_photos(
                 year=clean_year,
                 camera_make=clean_camera,
                 has_gps=clean_gps,
+                photo_ids=list(allowed_candidate_ids) if allowed_candidate_ids is not None else None,
                 is_trashed=None if include_trashed else False,
                 limit=100000,
                 offset=0
@@ -630,23 +849,48 @@ def list_photos(
                     year=clean_year,
                     camera_make=clean_camera,
                     has_gps=clean_gps,
+                    photo_ids=list(entity_photo_scores.keys()) if entity_photo_scores else None,
                     is_trashed=None if include_trashed else False,
                     limit=100000,
                     offset=0
                 )
-                allowed_candidate_ids = {p["id"] for p in fallback_photos} if fallback_photos else None
+                allowed_candidate_ids = {p["id"] for p in fallback_photos} if fallback_photos else (
+                    set(entity_photo_scores.keys()) if entity_photo_scores else None
+                )
 
         # 3. Perform Semantic Vector Search with pre-filtered candidate subset
         search_prompt = parsed.visual_prompt or query.strip()
         vector_engine = VectorEngine.get_instance()
-        
+
+        # Ensure all tagged photos for the matched entity have CLIP embeddings so scene filtering covers 100% of their tagged photos
+        if entity_photo_scores and allowed_candidate_ids:
+            missing_emb_ids = list(allowed_candidate_ids - set(vector_engine.photo_ids))
+            if missing_emb_ids and len(missing_emb_ids) <= 300:
+                missing_photos, _ = get_photos(
+                    classification="ALL",
+                    photo_ids=missing_emb_ids,
+                    is_trashed=None if include_trashed else False,
+                    limit=len(missing_emb_ids),
+                    offset=0
+                )
+                to_index = [(p["id"], p["file_path"]) for p in missing_photos if p.get("file_path") and os.path.exists(p["file_path"])]
+                if to_index:
+                    vector_engine.batch_index_photos(to_index, batch_size=32)
+
         top_k_candidates = max(250, (actual_limit + actual_offset) * 4)
         search_results = vector_engine.search_text(
             search_prompt,
             top_k=top_k_candidates,
             allowed_photo_ids=allowed_candidate_ids
         )
-        
+
+        # If searching a tagged entity + scene but CLIP embeddings haven't been generated yet for those photos, fall back to tagged photos
+        if not search_results and entity_photo_scores and allowed_candidate_ids:
+            search_results = [
+                {"photo_id": pid, "similarity_score": entity_photo_scores.get(pid, 0.85)}
+                for pid in allowed_candidate_ids
+            ]
+
         if not search_results:
             return {
                 "photos": [],
@@ -668,16 +912,17 @@ def list_photos(
             offset=0
         )
 
-        # 4. Hybrid scoring: apply entity/folder keyword boost
+        # 4. Hybrid scoring: apply entity tag boost and folder keyword boost
         scored_photos = []
         for p in photos:
             base_score = photo_id_to_score.get(p["id"], 0.15)
-            # Folder boost: if photo path or filename contains any parsed folder keyword, boost score
             boost = 0.0
+            if p["id"] in entity_photo_scores:
+                boost += 0.12 if entity_photo_scores[p["id"]] >= 1.0 else 0.08
             if parsed.folder_keywords:
                 p_path_lower = p["file_path"].lower()
                 if any(kw in p_path_lower for kw in parsed.folder_keywords):
-                    boost = 0.09  # Significant boost for entity/folder match
+                    boost += 0.09  # Significant boost for entity/folder match
             p["similarity_score"] = round(base_score + boost, 4)
             scored_photos.append(p)
 
@@ -797,12 +1042,17 @@ def get_photo_original(photo_id: int, download: bool = False):
         photo["file_path"],
         filename=photo["file_name"] if download else None,
         content_disposition_type="attachment" if download else "inline",
-        media_type=media_type
+        media_type=media_type,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; sandbox"
+        }
     )
 
 @app.post("/api/photos/{photo_id}/reveal")
-def reveal_photo_in_file_explorer(photo_id: int):
+def reveal_photo_in_file_explorer(photo_id: int, request: Request):
     """Opens Windows Explorer with the photo file selected."""
+    _require_loopback_client(request)
     photo = get_photo_by_id(photo_id)
     if not photo or not os.path.exists(photo["file_path"]):
         raise HTTPException(status_code=404, detail="Photo file not found on disk")
@@ -810,8 +1060,12 @@ def reveal_photo_in_file_explorer(photo_id: int):
     try:
         import subprocess
         norm_path = os.path.normpath(photo["file_path"])
-        subprocess.Popen(f'explorer /select,"{norm_path}"')
+        if norm_path.startswith("\\\\") or norm_path.startswith("//"):
+            raise HTTPException(status_code=400, detail="Network UNC paths are not permitted")
+        subprocess.Popen(["explorer.exe", f"/select,{norm_path}"])
         return {"success": True, "message": "Revealed in File Explorer"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -876,12 +1130,14 @@ def get_local_ip_addresses():
     return ip_list
 
 @app.get("/api/network-info")
-def get_network_info():
+def get_network_info(request: Request):
     """Returns one-time pairing URLs for devices on the home network."""
+    _require_loopback_client(request)
     port = 8500
     ips = get_local_ip_addresses()
     with _LAN_PAIRING_LOCK:
         _LAN_ACCESS_STATE["pairing_token"] = secrets.token_urlsafe(32)
+        _LAN_ACCESS_STATE["pairing_expires_at"] = time.time() + _PAIRING_TTL_SECONDS
         pairing_token = _LAN_ACCESS_STATE["pairing_token"]
     urls = [f"http://{ip}:{port}/api/access/pair#{pairing_token}" for ip in ips]
     return {
@@ -909,12 +1165,14 @@ fetch('/api/access/pair', { method: 'POST', headers: { 'Content-Type': 'applicat
 def pair_lan_device(req: PairDeviceRequest, response: Response):
     """Redeems a one-time LAN pairing token and sets a browser session cookie."""
     with _LAN_PAIRING_LOCK:
-        if not hmac.compare_digest(req.token, _LAN_ACCESS_STATE["pairing_token"]):
+        is_expired = time.time() > float(_LAN_ACCESS_STATE.get("pairing_expires_at", 0))
+        if is_expired or not hmac.compare_digest(req.token, str(_LAN_ACCESS_STATE["pairing_token"])):
             raise HTTPException(status_code=403, detail="Invalid or expired pairing link")
         _LAN_ACCESS_STATE["pairing_token"] = secrets.token_urlsafe(32)
+        _LAN_ACCESS_STATE["pairing_expires_at"] = 0
     response.set_cookie(
         key=_LAN_SESSION_COOKIE,
-        value=_LAN_ACCESS_STATE["session_token"],
+        value=str(_LAN_ACCESS_STATE["session_token"]),
         max_age=7 * 24 * 60 * 60,
         httponly=True,
         samesite="strict",
@@ -922,6 +1180,34 @@ def pair_lan_device(req: PairDeviceRequest, response: Response):
         path="/",
     )
     return {"paired": True}
+
+@app.post("/api/access/revoke")
+def revoke_lan_sessions(request: Request):
+    """Rotates the LAN session token, immediately revoking all paired LAN devices."""
+    _require_loopback_client(request)
+    with _LAN_PAIRING_LOCK:
+        _LAN_ACCESS_STATE["session_token"] = secrets.token_urlsafe(32)
+        _LAN_ACCESS_STATE["pairing_token"] = secrets.token_urlsafe(32)
+        _LAN_ACCESS_STATE["pairing_expires_at"] = 0
+    return {"revoked": True}
+
+def _cleanup_deleted_photo_files(photo_id: int, box_ids: Optional[List[int]] = None):
+    """Removes cached thumbnails ('thumb', 'preview', 'full') and face crop files for a deleted photo."""
+    for size_type in ("thumb", "preview", "full"):
+        t_path = get_thumbnail_path(photo_id, size_type)
+        if os.path.exists(t_path):
+            try:
+                os.remove(t_path)
+            except Exception:
+                pass
+    if box_ids:
+        for bid in box_ids:
+            crop_path = os.path.join(CROPS_CACHE_DIR, f"{bid}.jpg")
+            if os.path.exists(crop_path):
+                try:
+                    os.remove(crop_path)
+                except Exception:
+                    pass
 
 @app.delete("/api/photos/{photo_id}")
 def delete_photo(photo_id: int, permanent: bool = False):
@@ -946,27 +1232,37 @@ def delete_photo(photo_id: int, permanent: bool = False):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to delete file from disk: {str(e)}")
 
-    # Clean up cached thumbnails
-    for size_type in ("thumb", "preview"):
-        t_path = get_thumbnail_path(photo_id, size_type)
-        if os.path.exists(t_path):
-            try:
-                os.remove(t_path)
-            except Exception:
-                pass
-
-    # Permanently delete from Google Drive if backed up
+    # Permanently delete from Google Drive if backed up (persisted in deletion queue if offline)
     if photo.get("gdrive_file_id"):
+        fid = photo["gdrive_file_id"]
+        enqueue_gdrive_permanent_delete(fid, photo_id=photo_id, file_name=photo.get("file_name"))
         try:
-            GDriveService.get_instance().delete_photo_permanently(photo["gdrive_file_id"])
+            if GDriveService.get_instance().delete_photo_permanently(fid):
+                remove_pending_gdrive_delete(fid)
         except Exception as e:
-            print(f"Error deleting photo {photo_id} from Google Drive: {e}")
+            print(f"Error deleting photo {photo_id} from Google Drive (queued for retry): {e}")
 
-    # 3. Remove from database
+    # 3. Remove from database and collect box IDs for crop cleanup
     conn = get_connection()
+    box_ids = [r[0] for r in conn.execute("SELECT id FROM detected_boxes WHERE photo_id = ?", (photo_id,)).fetchall()]
     conn.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
     conn.commit()
     conn.close()
+
+    # Clean up cached thumbnails, crops, vectors, and entity avatars
+    _cleanup_deleted_photo_files(photo_id, box_ids)
+    try:
+        VectorEngine.get_instance().remove_photos([photo_id])
+    except Exception:
+        pass
+    if box_ids:
+        try:
+            repair_entity_avatars()
+        except Exception:
+            pass
+
+    if photo.get("gdrive_file_id"):
+        BackupWorker.get_instance().trigger_wake()
 
     # 4. Reconcile sibling clusters incrementally in O(1)
     if dup_group_id:
@@ -1002,8 +1298,8 @@ def toggle_photo_trash(photo_id: int, req: TrashToggleRequest = Body(...)):
     # Sync trash status to Google Drive
     if not req.is_trashed and photo.get("gdrive_file_id"):
         try:
-            GDriveService.get_instance().untrash_photo(photo["gdrive_file_id"])
-            update_photo_gdrive_status(photo_id, status="backed_up")
+            if GDriveService.get_instance().untrash_photo(photo["gdrive_file_id"], photo_id=photo_id):
+                update_photo_gdrive_status(photo_id, status="backed_up")
         except Exception as e:
             print(f"Error untrashing photo on Google Drive: {e}")
     
@@ -1084,7 +1380,11 @@ def empty_trash_all(permanent: bool = True):
         }
 
     deleted_names = []
+    deleted_ids = []
     freed_bytes = 0
+    gdrive_deleted_count = 0
+    gdrive_freed_bytes = 0
+    gdrive_queued_count = 0
     conn = get_connection()
 
     for photo in photos:
@@ -1092,7 +1392,7 @@ def empty_trash_all(permanent: bool = True):
         fpath = photo["file_path"]
         fsize = photo.get("file_size", 0)
 
-        # 1. Delete physical file
+        # 1. Delete physical file (abort DB/Drive deletion for this photo if local delete fails on existing file)
         if os.path.exists(fpath):
             try:
                 if not permanent and send2trash is not None:
@@ -1102,28 +1402,36 @@ def empty_trash_all(permanent: bool = True):
                 freed_bytes += fsize
                 deleted_names.append(photo["file_name"])
             except Exception as e:
-                print(f"Error removing file {fpath}: {e}")
+                print(f"Error removing file {fpath}, keeping DB and Drive backup intact: {e}")
+                continue
         else:
             deleted_names.append(photo["file_name"])
 
-        # 2. Clean thumbnails
-        for size_type in ("thumb", "preview"):
-            t_path = get_thumbnail_path(pid, size_type)
-            if os.path.exists(t_path):
-                try:
-                    os.remove(t_path)
-                except Exception:
-                    pass
+        # 2. Collect box IDs before deleting DB record
+        box_ids = [r[0] for r in conn.execute("SELECT id FROM detected_boxes WHERE photo_id = ?", (pid,)).fetchall()]
 
-        # Permanently delete from Google Drive if backed up
+        # Permanently delete from Google Drive if backed up (durable via gdrive_delete_queue)
         if photo.get("gdrive_file_id"):
+            fid = photo["gdrive_file_id"]
+            conn.execute(
+                "INSERT OR IGNORE INTO gdrive_delete_queue (photo_id, gdrive_file_id, file_name, queued_at, attempts) VALUES (?, ?, ?, ?, 0)",
+                (pid, fid, photo.get("file_name") or "", time.time())
+            )
             try:
-                GDriveService.get_instance().delete_photo_permanently(photo["gdrive_file_id"])
+                if GDriveService.get_instance().delete_photo_permanently(fid):
+                    conn.execute("DELETE FROM gdrive_delete_queue WHERE gdrive_file_id = ?", (fid,))
+                    gdrive_deleted_count += 1
+                    gdrive_freed_bytes += fsize
+                else:
+                    gdrive_queued_count += 1
             except Exception as e:
-                print(f"Error deleting photo {pid} from Google Drive: {e}")
+                gdrive_queued_count += 1
+                print(f"Error deleting photo {pid} from Google Drive (queued for retry): {e}")
 
-        # 3. Remove DB record
+        # 3. Remove DB record and cached files
         conn.execute("DELETE FROM photos WHERE id = ?", (pid,))
+        deleted_ids.append(pid)
+        _cleanup_deleted_photo_files(pid, box_ids)
 
     # Immediately clean up any dead duplicate groups whose active non-trashed items <= 1
     conn.execute("""
@@ -1144,6 +1452,18 @@ def empty_trash_all(permanent: bool = True):
     conn.commit()
     conn.close()
 
+    if deleted_ids:
+        try:
+            VectorEngine.get_instance().remove_photos(deleted_ids)
+        except Exception:
+            pass
+        try:
+            repair_entity_avatars()
+        except Exception:
+            pass
+
+    BackupWorker.get_instance().trigger_wake()
+
     # Re-run deduplication pass in background thread to discover new clusters
     try:
         threading.Thread(target=run_deduplication_pass, daemon=True).start()
@@ -1151,7 +1471,13 @@ def empty_trash_all(permanent: bool = True):
         pass
 
     freed_mb = freed_bytes / (1024 ** 2)
-    message = f"Emptied trash: permanently removed {len(deleted_names)} photo(s), reclaiming {freed_mb:.2f} MB of disk space."
+    gdrive_freed_mb = gdrive_freed_bytes / (1024 ** 2)
+    drive_summary = ""
+    if gdrive_deleted_count > 0:
+        drive_summary = f" Also permanently deleted {gdrive_deleted_count} backup(s) from Google Drive ({gdrive_freed_mb:.2f} MB freed on Drive)."
+    if gdrive_queued_count > 0:
+        drive_summary += f" ({gdrive_queued_count} Google Drive deletion(s) queued to complete as soon as Drive is reachable.)"
+    message = f"Emptied trash: permanently removed {len(deleted_names)} photo(s), reclaiming {freed_mb:.2f} MB of local disk space.{drive_summary}"
     
     log_trash_purge(
         freed_bytes=freed_bytes,
@@ -1166,17 +1492,23 @@ def empty_trash_all(permanent: bool = True):
         "deleted_count": len(deleted_names),
         "freed_bytes": freed_bytes,
         "freed_mb": round(freed_mb, 2),
+        "gdrive_deleted_count": gdrive_deleted_count,
+        "gdrive_freed_mb": round(gdrive_freed_mb, 2),
+        "gdrive_queued_count": gdrive_queued_count,
         "deleted_files": deleted_names
     }
 
 @app.post("/api/trash/restore-all")
 def restore_all_trash():
-    """Restores all trashed photos back to the active library."""
+    """Restores all trashed photos back to the active library and wakes Drive sync."""
     conn = get_connection()
     cursor = conn.execute("UPDATE photos SET is_trashed = 0, trashed_at = NULL WHERE is_trashed = 1")
     count = cursor.rowcount
     conn.commit()
     conn.close()
+
+    if count > 0:
+        BackupWorker.get_instance().trigger_wake()
 
     return {
         "message": f"Successfully restored {count} photo(s) to your photo library.",
@@ -1211,7 +1543,7 @@ def purge_trash_for_space(req: PurgeSpaceRequest = Body(...)):
 
     # Fetch trashed photos sorted oldest trashed first (FIFO)
     conn = get_connection()
-    cursor = conn.execute("SELECT id, file_path, file_name, file_size FROM photos WHERE is_trashed = 1 ORDER BY trashed_at ASC, id ASC")
+    cursor = conn.execute("SELECT id, file_path, file_name, file_size, gdrive_file_id FROM photos WHERE is_trashed = 1 ORDER BY trashed_at ASC, id ASC")
     trashed_candidates = [dict(r) for r in cursor.fetchall()]
     conn.close()
 
@@ -1241,6 +1573,7 @@ def purge_trash_for_space(req: PurgeSpaceRequest = Body(...)):
     # Permanently delete selected candidates
     conn = get_connection()
     deleted_names = []
+    deleted_ids = []
     actually_freed_bytes = 0
 
     for item in to_delete:
@@ -1263,31 +1596,45 @@ def purge_trash_for_space(req: PurgeSpaceRequest = Body(...)):
                     actually_freed_bytes += fsize
                     deleted_names.append(item["file_name"])
                 except Exception as e2:
-                    print(f"Error purging file {fpath}: {e2}")
+                    print(f"Error purging file {fpath}, keeping DB and Drive backup intact: {e2}")
+                    continue
         else:
             deleted_names.append(item["file_name"])
 
-        # Delete cached thumbnails
-        for size_type in ("thumb", "preview"):
-            t_path = get_thumbnail_path(pid, size_type)
-            if os.path.exists(t_path):
-                try:
-                    os.remove(t_path)
-                except Exception:
-                    pass
+        box_ids = [r[0] for r in conn.execute("SELECT id FROM detected_boxes WHERE photo_id = ?", (pid,)).fetchall()]
 
-        # Permanently delete from Google Drive if backed up
+        # Permanently delete from Google Drive if backed up (durable via gdrive_delete_queue)
         if item.get("gdrive_file_id"):
+            fid = item["gdrive_file_id"]
+            conn.execute(
+                "INSERT OR IGNORE INTO gdrive_delete_queue (photo_id, gdrive_file_id, file_name, queued_at, attempts) VALUES (?, ?, ?, ?, 0)",
+                (pid, fid, item.get("file_name") or "", time.time())
+            )
             try:
-                GDriveService.get_instance().delete_photo_permanently(item["gdrive_file_id"])
+                if GDriveService.get_instance().delete_photo_permanently(fid):
+                    conn.execute("DELETE FROM gdrive_delete_queue WHERE gdrive_file_id = ?", (fid,))
             except Exception as e:
-                print(f"Error deleting photo {pid} from Google Drive: {e}")
+                print(f"Error deleting photo {pid} from Google Drive (queued for retry): {e}")
 
-        # Remove from database
+        # Remove from database and cached files
         conn.execute("DELETE FROM photos WHERE id = ?", (pid,))
+        deleted_ids.append(pid)
+        _cleanup_deleted_photo_files(pid, box_ids)
 
     conn.commit()
     conn.close()
+
+    if deleted_ids:
+        try:
+            VectorEngine.get_instance().remove_photos(deleted_ids)
+        except Exception:
+            pass
+        try:
+            repair_entity_avatars()
+        except Exception:
+            pass
+
+    BackupWorker.get_instance().trigger_wake()
 
     freed_mb = actually_freed_bytes / (1024 ** 2)
     files_sample = ", ".join(deleted_names[:5]) + (f" and {len(deleted_names) - 5} more" if len(deleted_names) > 5 else "")
@@ -1336,6 +1683,81 @@ def get_backup_status():
     """Returns real-time Google Drive backup state, quotas, and current progress."""
     return BackupWorker.get_instance().get_state()
 
+@app.post("/api/backup/credentials")
+async def upload_backup_credentials(request: Request, file: Optional[UploadFile] = File(None)):
+    """
+    Uploads and validates a Google Cloud OAuth 2.0 Client ID JSON file and saves it as
+    backend/credentials.json. Restricted to loopback clients.
+    """
+    _require_loopback_client(request)
+    from backend.gdrive_auth import save_credentials_json
+
+    raw_json = ""
+    if file is not None:
+        raw_bytes = await file.read(256 * 1024)
+        await file.close()
+        raw_json = raw_bytes.decode("utf-8", errors="replace")
+    else:
+        body_bytes = await request.body()
+        body_text = body_bytes.decode("utf-8", errors="replace").strip()
+        if not body_text:
+            raise HTTPException(status_code=400, detail="Empty credentials payload")
+        try:
+            import json as _json
+            parsed_body = _json.loads(body_text)
+            if isinstance(parsed_body, dict) and "credentials_json" in parsed_body:
+                raw_json = str(parsed_body["credentials_json"])
+            else:
+                raw_json = body_text
+        except Exception:
+            raw_json = body_text
+
+    try:
+        info = save_credentials_json(raw_json)
+        GDriveService.get_instance().reset_service()
+        BackupWorker.get_instance().trigger_wake()
+        return {
+            "message": "Google OAuth credentials saved successfully",
+            **info
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.post("/api/backup/sync-now")
+def trigger_backup_sync_now(req: Optional[SyncNowRequest] = Body(default=None)):
+    """Triggers an immediate backup pass (and optionally retries failed uploads)."""
+    retry_failed = bool(req.retry_failed) if req else False
+    result = BackupWorker.get_instance().trigger_sync_now(retry_failed=retry_failed)
+    return {
+        "message": "Immediate Google Drive sync triggered",
+        **result
+    }
+
+@app.post("/api/backup/verify")
+def verify_backup_integrity():
+    """
+    Audits Google Drive backup state against local database records:
+    - Verifies backed-up files exist on Google Drive with matching file size
+    - Re-queues any missing or mismatched files for automatic re-upload
+    - Ensures locally trashed files are in Google Drive Trash
+    - Flushes any pending permanent deletions from Empty Trash
+    """
+    try:
+        report = GDriveService.get_instance().verify_backups()
+        BackupWorker.get_instance()._sync_trashed_photos()
+        BackupWorker.get_instance().trigger_wake()
+        return {
+            "message": (
+                f"Verified {report['checked']} cloud backup(s): "
+                f"{report['verified_ok']} intact, {report['requeued_missing']} re-queued for upload."
+            ),
+            **report
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Backup verification failed: {exc}")
+
 @app.get("/api/backup/auth/url")
 def get_backup_auth_url(redirect_uri: Optional[str] = None):
     """Generates the direct Google OAuth consent URL for the frontend."""
@@ -1360,10 +1782,11 @@ def get_backup_auth_url(redirect_uri: Optional[str] = None):
 def handle_backup_auth_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
     """Handles OAuth redirect from Google, stores credentials token, and wakes worker."""
     if error:
+        safe_error = html.escape(str(error))
         return HTMLResponse(
             f"<div style='font-family:sans-serif;padding:40px;background:#0f172a;color:#f8fafc;min-height:100vh;'>"
             f"<h2 style='color:#f87171;'>Google Authorization Failed</h2>"
-            f"<p>{error}</p><a href='/' style='color:#38bdf8;'>Return to LuminaPhoto</a></div>",
+            f"<p>{safe_error}</p><a href='/' style='color:#38bdf8;'>Return to LuminaPhoto</a></div>",
             status_code=400
         )
     if not code:
@@ -1387,6 +1810,14 @@ def handle_backup_auth_callback(code: Optional[str] = None, state: Optional[str]
             p { color: #cbd5e1; font-size: 15px; line-height: 1.5; }
             .btn { display: inline-block; margin-top: 16px; padding: 10px 20px; background: #10b981; color: white; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 14px; }
           </style>
+          <script>
+            try {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({ type: 'LUMINA_GDRIVE_CONNECTED' }, window.location.origin);
+                setTimeout(function() { window.close(); }, 500);
+              }
+            } catch (e) {}
+          </script>
         </head>
         <body>
           <div class="card">
@@ -1399,18 +1830,23 @@ def handle_backup_auth_callback(code: Optional[str] = None, state: Optional[str]
         </html>
         """)
     except Exception as e:
+        safe_exc = html.escape(str(e))
         return HTMLResponse(
             f"<div style='font-family:sans-serif;padding:40px;background:#0f172a;color:#f8fafc;min-height:100vh;'>"
             f"<h2 style='color:#f87171;'>Error Linking Google Drive</h2>"
-            f"<p>{str(e)}</p><a href='/' style='color:#38bdf8;'>Return to LuminaPhoto</a></div>",
+            f"<p>{safe_exc}</p><a href='/' style='color:#38bdf8;'>Return to LuminaPhoto</a></div>",
             status_code=500
         )
 
 @app.post("/api/backup/auth/exchange")
-def exchange_code_endpoint(req: ExchangeCodeRequest):
+def exchange_code_endpoint(req: ExchangeCodeRequest, request: Request):
     """Allows manual or frontend programmatic code exchange."""
+    _require_loopback_client(request)
     from backend.gdrive_auth import exchange_auth_code
-    exchange_auth_code(req.code, state=req.state, redirect_uri=req.redirect_uri or "http://localhost:8500/api/backup/auth/callback")
+    try:
+        exchange_auth_code(req.code, state=req.state, redirect_uri=req.redirect_uri or "http://localhost:8500/api/backup/auth/callback")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     GDriveService.get_instance().reset_service()
     BackupWorker.get_instance().trigger_wake()
     return {"message": "Google Drive connected successfully", "connected": True}
@@ -1500,6 +1936,8 @@ def trash_all_duplicates_endpoint():
     The primary keeper photo for each group remains in the main gallery.
     """
     count, freed_bytes = trash_all_duplicates()
+    if count > 0:
+        BackupWorker.get_instance().trigger_wake()
     try:
         threading.Thread(target=run_deduplication_pass, daemon=True).start()
     except Exception:
@@ -1519,6 +1957,8 @@ def trash_group_duplicates_endpoint(group_id: str):
     The primary keeper photo remains safe in the main gallery.
     """
     count, freed_bytes = trash_group_duplicates(group_id)
+    if count > 0:
+        BackupWorker.get_instance().trigger_wake()
     try:
         cleanup_duplicate_group(group_id)
     except Exception:
@@ -1660,25 +2100,39 @@ class PeoplePetsScanManager:
 
     def _run(self):
         try:
+            detector = FacePetDetector.get_instance()
+            # 1. Fast in-memory re-evaluation of all existing UNASSIGNED boxes (including on group photos)
+            rematched_count = detector.rematch_unassigned_boxes()
+            self.matches_found += rematched_count
+
+            # 2. Only run heavy image detection on photos that have not been scanned yet
             conn = get_connection()
             rows = conn.execute("""
-                SELECT p.id, p.file_path FROM photos p
+                SELECT p.id, p.file_path
+                FROM photos p
                 LEFT JOIN detected_boxes b ON p.id = b.photo_id
-                WHERE b.id IS NULL AND p.is_trashed = 0 AND p.classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO')
+                WHERE b.id IS NULL
+                  AND p.is_trashed = 0
+                  AND p.classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO')
                 ORDER BY p.id DESC
             """).fetchall()
             conn.close()
 
             self.total = len(rows)
-            detector = FacePetDetector.get_instance()
-            entity_embeddings = get_confirmed_embeddings_for_entities()
 
             for r in rows:
                 if self.stopped:
                     break
                 pid, fpath = r["id"], r["file_path"]
                 if os.path.exists(fpath):
-                    boxes = detector.process_photo(pid, fpath, entity_embeddings=entity_embeddings)
+                    boxes = detector.process_photo(
+                        pid,
+                        fpath,
+                        force_reprocess=False
+                    )
+                    for box in boxes:
+                        if box.get("entity_id") is not None:
+                            cleanup_redundant_boxes(pid, box["id"])
                     pending_in_photo = sum(1 for b in boxes if b.get("status") == "PENDING_REVIEW")
                     self.matches_found += pending_in_photo
                 self.processed += 1
@@ -1736,7 +2190,8 @@ def get_pending_reviews(
 def confirm_all_pending_reviews():
     """Confirms the complete pending suggestion queue atomically."""
     confirmed_count = confirm_all_pending_boxes()
-    return {"confirmed_count": confirmed_count}
+    rematched_count = FacePetDetector.get_instance().rematch_unassigned_boxes()
+    return {"confirmed_count": confirmed_count, "rematched_count": rematched_count}
 
 def cleanup_redundant_boxes(photo_id: int, target_box_id: int):
     """
@@ -1754,8 +2209,8 @@ def cleanup_redundant_boxes(photo_id: int, target_box_id: int):
         for other in all_boxes:
             if other["id"] == target_box_id:
                 continue
-            # Only clean up unassigned boxes
-            if other.get("entity_id") is not None and other.get("status") == "CONFIRMED":
+            # Only clean up boxes that have no identity assignment
+            if other.get("entity_id") is not None:
                 continue
 
             # Check if other is nested inside main_box
@@ -1827,8 +2282,9 @@ def confirm_box_endpoint(box_id: int, entity_id: Optional[int] = Query(None)):
 
     # Clean up redundant unassigned boxes (e.g. unassigned face inside a named pet)
     cleanup_redundant_boxes(box["photo_id"], box_id)
+    rematched_count = FacePetDetector.get_instance().rematch_unassigned_boxes()
 
-    return {"message": "Box confirmed successfully", "box_id": box_id, "entity_id": target_eid}
+    return {"message": "Box confirmed successfully", "box_id": box_id, "entity_id": target_eid, "rematched_count": rematched_count}
 
 @app.post("/api/people-pets/boxes/{box_id}/reject")
 def reject_box_endpoint(box_id: int):
@@ -1843,7 +2299,8 @@ def reject_box_endpoint(box_id: int):
 def batch_confirm_endpoint(req: BatchConfirmRequest):
     """Confirms multiple suggestions at once."""
     count = batch_confirm_boxes(req.box_ids)
-    return {"message": f"Confirmed {count} suggestions", "count": count}
+    rematched_count = FacePetDetector.get_instance().rematch_unassigned_boxes()
+    return {"message": f"Confirmed {count} suggestions", "count": count, "rematched_count": rematched_count}
 
 @app.post("/api/people-pets/resolve-duplicates")
 def resolve_duplicate_entities_endpoint():
@@ -1882,11 +2339,15 @@ def assign_box_to_entity(box_id: int, req: AssignBoxRequest):
     if req.set_as_avatar or not entity.get("avatar_box_id"):
         update_entity(entity_id, avatar_box_id=box_id)
 
+    cleanup_redundant_boxes(box["photo_id"], box_id)
+    rematched_count = FacePetDetector.get_instance().rematch_unassigned_boxes()
+
     return {
         "message": f"Successfully tagged as {req.entity_name}",
         "box_id": box_id,
         "entity_id": entity_id,
-        "entity_name": req.entity_name
+        "entity_name": req.entity_name,
+        "rematched_count": rematched_count
     }
 
 @app.post("/api/people-pets/entities/{entity_id}/set-avatar")
@@ -1923,6 +2384,9 @@ def get_photo_boxes(photo_id: int):
 
     detector = FacePetDetector.get_instance()
     boxes = detector.process_photo(photo_id, photo["file_path"])
+    for box in boxes:
+        if box.get("entity_id") is not None:
+            cleanup_redundant_boxes(photo_id, box["id"])
     # Enrich with entity names
     enriched = get_boxes_for_photo(photo_id)
     return {"boxes": enriched if enriched else boxes}
@@ -1975,6 +2439,8 @@ def create_manual_box(photo_id: int, req: CreateBoxRequest):
         entity = get_entity_by_id(entity_id)
         if entity and not entity.get("avatar_box_id"):
             update_entity(entity_id, avatar_box_id=box_id)
+        cleanup_redundant_boxes(photo_id, box_id)
+        FacePetDetector.get_instance().rematch_unassigned_boxes()
 
     return {"message": "Bounding box created", "box": box_record}
 
@@ -2032,6 +2498,9 @@ def update_photo_box(photo_id: int, box_id: int, req: UpdateBoxRequest):
         except Exception as e:
             print(f"Error re-extracting resized box crop: {e}")
 
+    if entity_id and status == "CONFIRMED":
+        FacePetDetector.get_instance().rematch_unassigned_boxes()
+
     return {"message": "Box updated successfully", "box_id": box_id, "entity_id": entity_id}
 
 @app.delete("/api/photos/{photo_id}/boxes/{box_id}")
@@ -2088,14 +2557,24 @@ if os.path.exists(FRONTEND_DIST):
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str):
-        if full_path.startswith("api/") or full_path == "api":
+        normalized_rel = full_path.replace("\\", "/").lstrip("/")
+        if normalized_rel.startswith("api/") or normalized_rel == "api":
             raise HTTPException(status_code=404, detail="API endpoint not found")
 
-        target = os.path.join(FRONTEND_DIST, full_path)
-        if full_path and os.path.isfile(target):
-            return FileResponse(target)
+        dist_real = os.path.realpath(FRONTEND_DIST)
+        target_real = os.path.realpath(os.path.join(dist_real, normalized_rel))
+        try:
+            is_within_dist = os.path.commonpath([dist_real, target_real]) == dist_real
+        except ValueError:
+            is_within_dist = False
 
-        index_file = os.path.join(FRONTEND_DIST, "index.html")
+        if not is_within_dist:
+            raise HTTPException(status_code=404, detail="Not found")
+
+        if normalized_rel and os.path.isfile(target_real):
+            return FileResponse(target_real)
+
+        index_file = os.path.join(dist_real, "index.html")
         if os.path.exists(index_file):
             return FileResponse(index_file)
         raise HTTPException(status_code=404, detail="Frontend index.html not found")

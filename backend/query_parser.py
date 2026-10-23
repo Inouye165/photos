@@ -48,29 +48,35 @@ class ParsedQuery:
         self,
         raw_query: str,
         visual_prompt: str,
-        entities: List[Dict[str, str]],
+        entities: List[Dict[str, Any]],
         folder_keywords: List[str],
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
         date_label: Optional[str] = None,
         classification: Optional[str] = "REAL_PHOTOS",
-        temporal_phrase: Optional[str] = None
+        temporal_phrase: Optional[str] = None,
+        entity_ids: Optional[List[int]] = None,
+        has_visual_scene: bool = True
     ):
         self.raw_query = raw_query
         self.visual_prompt = visual_prompt
-        self.entities = entities  # list of {"name": "dobby", "type": "dog"}
+        self.entities = entities  # list of {"id": 7, "name": "Ron", "type": "person"}
         self.folder_keywords = folder_keywords
         self.date_from = date_from
         self.date_to = date_to
         self.date_label = date_label
         self.classification = classification
         self.temporal_phrase = temporal_phrase
+        self.entity_ids = entity_ids or []
+        self.has_visual_scene = has_visual_scene
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "raw_query": self.raw_query,
             "visual_prompt": self.visual_prompt,
             "entities": self.entities,
+            "entity_ids": self.entity_ids,
+            "has_visual_scene": self.has_visual_scene,
             "folder_keywords": self.folder_keywords,
             "date_from": self.date_from,
             "date_to": self.date_to,
@@ -93,11 +99,22 @@ class QueryParser:
         self,
         known_folders: Optional[List[str]] = None,
         reference_date: Optional[datetime] = None,
-        entity_aliases: Optional[Dict[str, str]] = None
+        entity_aliases: Optional[Dict[str, str]] = None,
+        known_entities: Optional[List[Dict[str, Any]]] = None
     ):
         self.known_folders = [f.lower() for f in (known_folders or [])]
         self.reference_date = reference_date or datetime.now()
         self.entity_aliases = {**self.DEFAULT_ALIASES, **(entity_aliases or {})}
+        # Sort known DB entities so active entities (with photos) and longer names match first
+        raw_entities = [
+            e for e in (known_entities or [])
+            if isinstance(e, dict) and str(e.get("name", "")).strip()
+        ]
+        self.known_entities = sorted(
+            raw_entities,
+            key=lambda e: (1 if (e.get("total_photos") or 0) > 0 else 0, len(str(e["name"]).strip())),
+            reverse=True
+        )
 
     def parse(self, raw_query: str) -> ParsedQuery:
         text = raw_query.strip()
@@ -106,7 +123,9 @@ class QueryParser:
                 raw_query="",
                 visual_prompt="",
                 entities=[],
-                folder_keywords=[]
+                folder_keywords=[],
+                entity_ids=[],
+                has_visual_scene=False
             )
 
         working = text
@@ -124,8 +143,9 @@ class QueryParser:
             working = re.sub(r"\b(all\s+files|everything|all\s+photos\s+and\s+screenshots)\b", "", working, flags=re.I).strip()
 
         # 2. Extract parenthetical entity annotations like "dobby(my dog)" or "charlie (pet cat)"
-        entities = []
-        folder_keywords = []
+        entities: List[Dict[str, Any]] = []
+        matched_entity_ids: List[int] = []
+        folder_keywords: List[str] = []
         visual_replacements = {}
 
         paren_matches = re.finditer(r"(\b[a-zA-Z0-9_\-]{2,25})\s*\(([^)]+)\)", working)
@@ -156,13 +176,36 @@ class QueryParser:
             # Remove temporal phrase from the visual prompt string
             cleaned = re.sub(re.escape(temp_phrase), "", cleaned, flags=re.I).strip()
 
-        # 5. Check against known entity aliases (e.g. dobby -> dog)
+        # 5a. Check against tagged People & Pets from the database (entities table)
+        for db_ent in self.known_entities:
+            ent_name = str(db_ent.get("name", "")).strip()
+            ent_id = db_ent.get("id")
+            if not ent_name or len(ent_name) < 2:
+                continue
+            pattern = rf"\b{re.escape(ent_name)}(?:'s)?\b"
+            if re.search(pattern, cleaned, re.I):
+                ent_type_raw = str(db_ent.get("entity_type", "PERSON")).upper()
+                ent_type_label = "pet" if ent_type_raw == "PET" else "person"
+                if ent_id is not None and int(ent_id) not in matched_entity_ids:
+                    matched_entity_ids.append(int(ent_id))
+                if not any(str(e.get("name", "")).lower() == ent_name.lower() for e in entities):
+                    ent_entry: Dict[str, Any] = {"name": ent_name, "type": ent_type_label}
+                    if ent_id is not None:
+                        ent_entry["id"] = int(ent_id)
+                    entities.append(ent_entry)
+                if ent_name.lower() in self.known_folders and ent_name.lower() not in folder_keywords:
+                    folder_keywords.append(ent_name.lower())
+                cleaned = re.sub(pattern, " ", cleaned, flags=re.I).strip()
+
+        # 5b. Check against known entity aliases (e.g. dobby -> dog, puppy -> dog)
         for alias, visual_concept in self.entity_aliases.items():
+            # Skip if already matched as a database entity
+            if any(str(e.get("name", "")).lower() == alias.lower() for e in entities):
+                continue
             if re.search(rf"\b{re.escape(alias)}\b", cleaned, re.I):
                 if alias not in folder_keywords:
                     folder_keywords.append(alias)
-                if not any(e["name"].lower() == alias for e in entities):
-                    entities.append({"name": alias.capitalize(), "type": visual_concept})
+                entities.append({"name": alias.capitalize(), "type": visual_concept})
                 cleaned = re.sub(rf"\b{re.escape(alias)}\b", visual_concept, cleaned, flags=re.I)
 
         # 6. Check against known folder names (e.g. if library has folder "Dobby" or "Yellowstone")
@@ -174,23 +217,36 @@ class QueryParser:
                 if kf not in folder_keywords:
                     folder_keywords.append(kf)
                 # If not already in entities, add as matched folder entity
-                if not any(e["name"].lower() == kf for e in entities):
+                if not any(str(e.get("name", "")).lower() == kf for e in entities):
                     entities.append({"name": kf.capitalize(), "type": "folder"})
 
         # 7. Clean and construct the visual prompt for CLIP
-        # Remove trailing/leading prepositions like "at", "in", "on", "from", "of", "a", "an" left behind
+        # Remove trailing/leading prepositions/conjunctions like "at", "in", "on", "from", "of", "and", "with" left behind
         visual_tokens = re.sub(r"\s+", " ", cleaned).strip()
-        visual_tokens = re.sub(r"^(?:at|in|on|from|with|during|of|a|an)\s+", "", visual_tokens, flags=re.I)
-        visual_tokens = re.sub(r"^(?:at|in|on|from|with|during|of|a|an)\s+", "", visual_tokens, flags=re.I)
-        visual_tokens = re.sub(r"\s+(?:at|in|on|from|with|during|of)$", "", visual_tokens, flags=re.I)
+        for _ in range(3):
+            visual_tokens = re.sub(
+                r"^(?:at|in|on|from|with|during|of|and|a|an|the|me|all|show|find)\b\s*",
+                "",
+                visual_tokens,
+                flags=re.I
+            ).strip()
+            visual_tokens = re.sub(
+                r"\s*\b(?:at|in|on|from|with|during|of|and|a|an|the)$",
+                "",
+                visual_tokens,
+                flags=re.I
+            ).strip()
         visual_tokens = re.sub(r"[!?,.]", "", visual_tokens).strip()
 
-        # If visual tokens became empty, fall back to entities or working
+        has_visual_scene = bool(visual_tokens)
+
+        # If visual tokens became empty, fall back to entity types (for non-DB aliases) or empty string for pure DB entity lookup
         if not visual_tokens:
-            if entities:
+            if entities and not matched_entity_ids:
                 visual_tokens = " ".join(e.get("type", e["name"]) for e in entities)
-            else:
+            elif not entities:
                 visual_tokens = text
+                has_visual_scene = True
 
         return ParsedQuery(
             raw_query=raw_query,
@@ -201,7 +257,9 @@ class QueryParser:
             date_to=date_to,
             date_label=date_label,
             classification=classification,
-            temporal_phrase=temp_phrase
+            temporal_phrase=temp_phrase,
+            entity_ids=matched_entity_ids,
+            has_visual_scene=has_visual_scene
         )
 
     def _extract_date_range(self, text: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:

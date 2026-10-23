@@ -24,7 +24,7 @@ from backend.database import (
 )
 from backend.vector_engine import VectorEngine
 
-# Threshold for auto-tagging suggestion. Matches >= 0.85 cosine similarity (~90%+ match) are queued for confirmation.
+# Minimum embedding similarity required before a known identity is suggested.
 STRICT_HIGH_CONFIDENCE_THRESHOLD = 0.85
 # Minimum margin between top match and runner-up candidate to prevent ambiguous tagging
 MIN_AMBIGUITY_MARGIN = 0.03
@@ -354,7 +354,7 @@ class FacePetDetector:
     ) -> List[Tuple[int, float]]:
         """
         Computes robust similarity scores for all entities against query embedding.
-        Returns sorted list of (entity_id, score) for all entities scoring >= threshold.
+        Returns a single clear winner or up to three close candidates above threshold.
         """
         if not entity_embeddings:
             return []
@@ -368,9 +368,9 @@ class FacePetDetector:
         entity_scores: List[Tuple[int, float]] = []
 
         for eid, exemplars in entity_embeddings.items():
-            if not exemplars:
+            if exemplars is None or len(exemplars) == 0:
                 continue
-            ex_mat = np.array(exemplars, dtype=np.float32)  # shape (K, 512)
+            ex_mat = exemplars if isinstance(exemplars, np.ndarray) else np.array(exemplars, dtype=np.float32)
             sims = np.dot(ex_mat, q_vec)
 
             # Robust scoring: if >= 3 exemplars, average top 3 to prevent single-outlier false matches
@@ -387,16 +387,10 @@ class FacePetDetector:
 
         entity_scores.sort(key=lambda x: x[1], reverse=True)
 
-        # Disambiguation margin: if the runner-up is within min_margin, mark as ambiguous
-        if len(entity_scores) > 1:
-            top_score = entity_scores[0][1]
-            runner_up_score = entity_scores[1][1]
-            if runner_up_score > 0 and (top_score - runner_up_score) < min_margin:
-                # Too close to call confidently
-                return []
-
         valid = [(eid, round(score, 4)) for eid, score in entity_scores if score >= threshold]
-        return valid
+        if len(valid) > 1 and valid[0][1] - valid[1][1] < min_margin:
+            return valid[:3]
+        return valid[:1]
 
     def match_against_entities(
         self,
@@ -407,7 +401,7 @@ class FacePetDetector:
     ) -> Tuple[Optional[int], float, str]:
         """
         Matches a query embedding against confirmed exemplar embeddings for all known entities.
-        Only matches >= threshold are suggested as PENDING_REVIEW.
+        Matches >= threshold are suggested for human review, including ambiguous top matches.
         Returns: (matched_entity_id, highest_similarity, status)
         """
         candidates = self.rank_entity_candidates(
@@ -460,13 +454,18 @@ class FacePetDetector:
                 raw_boxes = self.detect_in_image(img_oriented)
 
                 if entity_embeddings is None:
-                    entity_embeddings = get_confirmed_embeddings_for_entities()
+                    person_embeddings = get_confirmed_embeddings_for_entities(entity_type="PERSON")
+                    pet_embeddings = get_confirmed_embeddings_for_entities(entity_type="PET")
+                else:
+                    person_embeddings = entity_embeddings
+                    pet_embeddings = entity_embeddings
 
                 extracted_data = []
                 for b in raw_boxes:
                     emb, crop_pil = self.extract_crop_embedding(img_oriented, b)
+                    target_embs = pet_embeddings if b.get("box_type") == "PET" else person_embeddings
                     candidates = self.rank_entity_candidates(
-                        emb, entity_embeddings, threshold=STRICT_HIGH_CONFIDENCE_THRESHOLD
+                        emb, target_embs, threshold=STRICT_HIGH_CONFIDENCE_THRESHOLD
                     )
                     top_sim = candidates[0][1] if candidates else 0.0
                     extracted_data.append({
@@ -474,6 +473,10 @@ class FacePetDetector:
                         "emb": emb,
                         "crop_pil": crop_pil,
                         "candidates": candidates,
+                        "is_ambiguous": (
+                            len(candidates) > 1 and
+                            candidates[0][1] - candidates[1][1] < MIN_AMBIGUITY_MARGIN
+                        ),
                         "top_sim": top_sim
                     })
 
@@ -505,6 +508,20 @@ class FacePetDetector:
                         sim = item["top_sim"]
                         status = "UNASSIGNED"
 
+                    candidate_pairs = item["candidates"] if item["is_ambiguous"] else (
+                        [(matched_eid, sim)] if matched_eid is not None else []
+                    )
+                    candidate_pairs = [
+                        (eid, score)
+                        for eid, score in candidate_pairs
+                        if eid not in assigned_entities or eid == matched_eid
+                    ][:3]
+                    candidate_entities = [
+                        {"entity_id": eid, "score": score}
+                        for eid, score in candidate_pairs
+                        if eid is not None
+                    ]
+
                     box_record = {
                         "photo_id": photo_id,
                         "entity_id": matched_eid,
@@ -516,6 +533,7 @@ class FacePetDetector:
                         "x_max": b["x_max"],
                         "y_max": b["y_max"],
                         "embedding_json": json.dumps(emb),
+                        "candidate_entities_json": json.dumps(candidate_entities),
                         "status": status,
                         "match_confidence": sim
                     }
@@ -533,6 +551,146 @@ class FacePetDetector:
         except Exception as e:
             print(f"Error processing photo {photo_id} ({file_path}): {e}")
             return []
+
+    def rematch_unassigned_boxes(
+        self,
+        db_path: Optional[str] = None,
+        threshold: float = STRICT_HIGH_CONFIDENCE_THRESHOLD
+    ) -> int:
+        """
+        Fast in-memory re-evaluation of all UNASSIGNED detected boxes (including on group photos
+        where another person is already tagged) against the latest CONFIRMED exemplar embeddings.
+        Enforces strict PERSON vs PET type matching and per-photo mutual exclusion.
+        Returns the number of newly matched boxes moved to PENDING_REVIEW.
+        """
+        person_embs_raw = get_confirmed_embeddings_for_entities(db_path=db_path, entity_type="PERSON")
+        pet_embs_raw = get_confirmed_embeddings_for_entities(db_path=db_path, entity_type="PET")
+        if not person_embs_raw and not pet_embs_raw:
+            return 0
+
+        person_embs: Dict[int, Any] = {
+            eid: np.array(vecs, dtype=np.float32) for eid, vecs in person_embs_raw.items() if vecs
+        }
+        pet_embs: Dict[int, Any] = {
+            eid: np.array(vecs, dtype=np.float32) for eid, vecs in pet_embs_raw.items() if vecs
+        }
+
+        conn = get_connection(db_path)
+        try:
+            # 1. Find entities already assigned on each photo (CONFIRMED or PENDING_REVIEW)
+            existing_rows = conn.execute(
+                "SELECT photo_id, entity_id FROM detected_boxes "
+                "WHERE status IN ('CONFIRMED', 'PENDING_REVIEW') AND entity_id IS NOT NULL"
+            ).fetchall()
+            photo_assigned_entities: Dict[int, set] = {}
+            for r in existing_rows:
+                photo_assigned_entities.setdefault(int(r["photo_id"]), set()).add(int(r["entity_id"]))
+
+            # 2. Fetch all UNASSIGNED boxes with valid embeddings on non-trashed photos
+            unassigned_rows = conn.execute(
+                "SELECT b.id, b.photo_id, b.box_type, b.embedding_json "
+                "FROM detected_boxes b "
+                "JOIN photos p ON p.id = b.photo_id "
+                "WHERE b.status = 'UNASSIGNED' AND b.embedding_json IS NOT NULL AND p.is_trashed = 0 "
+                "ORDER BY b.photo_id ASC, b.confidence DESC"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not unassigned_rows:
+            return 0
+
+        # Group unassigned boxes by photo_id for per-photo mutual exclusion
+        boxes_by_photo: Dict[int, List[Dict[str, Any]]] = {}
+        for r in unassigned_rows:
+            boxes_by_photo.setdefault(int(r["photo_id"]), []).append(dict(r))
+
+        updates_to_apply: List[Tuple[int, str, float, str, int]] = []
+
+        for pid, p_boxes in boxes_by_photo.items():
+            assigned_on_photo = set(photo_assigned_entities.get(pid, set()))
+            extracted = []
+
+            for b in p_boxes:
+                try:
+                    emb = json.loads(b["embedding_json"])
+                except Exception:
+                    continue
+                if not isinstance(emb, list) or not emb:
+                    continue
+
+                target_embs = pet_embs if b.get("box_type") == "PET" else person_embs
+                if not target_embs:
+                    continue
+
+                raw_candidates = self.rank_entity_candidates(emb, target_embs, threshold=threshold)
+                # Filter out entities already assigned to another box in this photo
+                candidates = [(eid, score) for eid, score in raw_candidates if eid not in assigned_on_photo]
+                if not candidates:
+                    continue
+
+                extracted.append({
+                    "box_id": int(b["id"]),
+                    "candidates": candidates,
+                    "is_ambiguous": (
+                        len(candidates) > 1 and
+                        candidates[0][1] - candidates[1][1] < MIN_AMBIGUITY_MARGIN
+                    )
+                })
+
+            if not extracted:
+                continue
+
+            # Greedy 1-to-1 bipartite matching across unassigned boxes in this photo
+            all_matches = []
+            for idx, item in enumerate(extracted):
+                for eid, score in item["candidates"]:
+                    all_matches.append((score, idx, eid))
+
+            all_matches.sort(key=lambda x: x[0], reverse=True)
+            matched_indices: Dict[int, Tuple[int, float]] = {}
+
+            for score, idx, eid in all_matches:
+                if idx not in matched_indices and eid not in assigned_on_photo:
+                    matched_indices[idx] = (eid, score)
+                    assigned_on_photo.add(eid)
+
+            for idx, (matched_eid, sim) in matched_indices.items():
+                item = extracted[idx]
+                candidate_pairs = item["candidates"] if item["is_ambiguous"] else [(matched_eid, sim)]
+                candidate_pairs = [
+                    (eid, score)
+                    for eid, score in candidate_pairs
+                    if eid not in assigned_on_photo or eid == matched_eid
+                ][:3]
+                candidate_entities = [
+                    {"entity_id": eid, "score": score}
+                    for eid, score in candidate_pairs
+                ]
+                updates_to_apply.append((
+                    matched_eid,
+                    "PENDING_REVIEW",
+                    round(float(sim), 4),
+                    json.dumps(candidate_entities),
+                    item["box_id"]
+                ))
+
+        if not updates_to_apply:
+            return 0
+
+        conn = get_connection(db_path)
+        try:
+            with conn:
+                conn.executemany(
+                    "UPDATE detected_boxes "
+                    "SET entity_id = ?, status = ?, match_confidence = ?, candidate_entities_json = ? "
+                    "WHERE id = ? AND status = 'UNASSIGNED'",
+                    updates_to_apply
+                )
+        finally:
+            conn.close()
+
+        return len(updates_to_apply)
 
 
     def get_or_generate_crop(self, box_data: Dict[str, Any]) -> Optional[str]:

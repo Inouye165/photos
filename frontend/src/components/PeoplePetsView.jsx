@@ -32,11 +32,19 @@ import {
   assignBoxToEntity,
   setEntityAvatar,
   confirmBox,
-  rejectBox,
+  unlinkBox,
   confirmAllPendingReviews,
   startPeoplePetsScan,
   fetchPeoplePetsScanStatus
 } from '../api';
+
+function hasMultipleReviewCandidates(item) {
+  try {
+    return JSON.parse(item?.candidate_entities_json || '[]').length > 1;
+  } catch {
+    return false;
+  }
+}
 
 export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) {
   const [viewMode, setViewMode] = useState('hub'); // 'hub' (Profiles) or 'tagger' (Face Tagger Studio)
@@ -149,7 +157,7 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
   };
 
   // Confirmation actions
-  const handleConfirmSingle = async (boxId, entityId) => {
+  const handleConfirmSingle = useCallback(async (boxId, entityId) => {
     try {
       setIsProcessingAction(true);
       await confirmBox(boxId, entityId);
@@ -164,31 +172,28 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
     } finally {
       setIsProcessingAction(false);
     }
-  };
+  }, [loadData, pendingReviews.length, reviewIndex]);
 
-  const handleRejectSingle = async (boxId) => {
+  const handleMarkIdentityUnknown = useCallback(async (boxId) => {
     try {
       setIsProcessingAction(true);
-      await rejectBox(boxId);
-      setPendingReviews((prev) => prev.filter((b) => b.id !== boxId));
+      await unlinkBox(boxId);
+      setPendingReviews((prev) => prev.filter((box) => box.id !== boxId));
       setTotalPending((prev) => Math.max(0, prev - 1));
-      if (reviewIndex >= pendingReviews.length - 1) {
-        setReviewIndex(Math.max(0, pendingReviews.length - 2));
-      }
+      setIsReviewModalOpen(false);
+      loadData();
     } catch (err) {
-      alert('Failed to reject: ' + err.message);
+      alert('Failed to clear the suggested identity: ' + err.message);
     } finally {
       setIsProcessingAction(false);
     }
-  };
+  }, [loadData]);
 
   const handleConfirmAll = async () => {
     if (totalPending === 0) return;
     try {
       setIsProcessingAction(true);
       await confirmAllPendingReviews();
-      setPendingReviews([]);
-      setTotalPending(0);
       setIsReviewModalOpen(false);
       loadData();
     } catch (err) {
@@ -290,10 +295,12 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
         setIsReviewModalOpen(false);
       } else if (e.key === 'Enter') {
         const current = pendingReviews[reviewIndex];
-        if (current) handleConfirmSingle(current.id, current.entity_id);
+        if (current && !hasMultipleReviewCandidates(current)) {
+          handleConfirmSingle(current.id, current.entity_id);
+        }
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
         const current = pendingReviews[reviewIndex];
-        if (current) handleRejectSingle(current.id);
+        if (current) handleMarkIdentityUnknown(current.id);
       } else if (e.key === 'ArrowRight') {
         setReviewIndex((prev) => Math.min(pendingReviews.length - 1, prev + 1));
       } else if (e.key === 'ArrowLeft') {
@@ -302,7 +309,7 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isReviewModalOpen, pendingReviews, reviewIndex]);
+  }, [isReviewModalOpen, pendingReviews, reviewIndex, handleConfirmSingle, handleMarkIdentityUnknown]);
 
   // Filtered entities list
   const filteredEntities = entities.filter((ent) => {
@@ -315,6 +322,27 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
   });
 
   const activeReviewItem = pendingReviews[reviewIndex];
+  const activeReviewCandidates = (() => {
+    if (!activeReviewItem?.candidate_entities_json) return [];
+    try {
+      const candidates = JSON.parse(activeReviewItem.candidate_entities_json);
+      return Array.isArray(candidates)
+        ? candidates.slice(0, 3).map((candidate) => ({
+          ...candidate,
+          entity: entities.find((entity) => entity.id === candidate.entity_id)
+        })).filter((candidate) => candidate.entity)
+        : [];
+    } catch {
+      return [];
+    }
+  })();
+  const clearMatchCount = pendingReviews.filter((item) => {
+    try {
+      return JSON.parse(item.candidate_entities_json || '[]').length <= 1;
+    } catch {
+      return false;
+    }
+  }).length;
   const reviewConfidence = activeReviewItem && Number.isFinite(activeReviewItem.match_confidence)
     ? Math.round(Math.max(0, Math.min(1, activeReviewItem.match_confidence)) * 100)
     : null;
@@ -413,24 +441,27 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
             </div>
             <div>
               <div style={{ fontWeight: 600, fontSize: '1.05rem', color: '#ffffff' }}>
-                {totalPending} Strong Match{totalPending > 1 ? 'es' : ''} Ready for Confirmation
+                {totalPending} Identity Suggestion{totalPending > 1 ? 's' : ''} to Review
               </div>
               <div style={{ fontSize: '0.82rem', color: '#cbd5e1', marginTop: '2px' }}>
-                Strict high-confidence auto-detection found matches. Confirm or reject each suggestion below.
+                Every suggestion meets the similarity threshold. Choose among close matches; only clear matches can be confirmed in bulk.
               </div>
             </div>
           </div>
 
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-            <button
-              className="btn-primary"
-              style={{ background: '#059669', borderColor: '#10b981' }}
-              onClick={handleConfirmAll}
-              disabled={isProcessingAction}
-            >
-              <CheckCheck size={16} />
-              <span>Confirm All ({totalPending})</span>
-            </button>
+            {clearMatchCount > 0 && (
+              <button
+                className="btn-primary"
+                style={{ background: '#059669', borderColor: '#10b981' }}
+                onClick={handleConfirmAll}
+                disabled={isProcessingAction}
+                title="Confirm only suggestions with one credible match"
+              >
+                <CheckCheck size={16} />
+                <span>Confirm clear matches ({clearMatchCount})</span>
+              </button>
+            )}
             <button
               className="btn-secondary"
               style={{ borderColor: 'rgba(245, 158, 11, 0.4)', color: '#fde68a' }}
@@ -952,7 +983,7 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <Sparkles size={18} color="#fbbf24" />
                 <h3 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.2rem', color: '#ffffff' }}>
-                  Confirm Auto-Tag Suggestion
+                  {activeReviewCandidates.length > 1 ? 'Choose an identity' : 'Review identity suggestion'}
                 </h3>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -996,10 +1027,10 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
             <div className="review-details-box glass-card" style={{ marginTop: '1rem', padding: '1rem' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
                 <span style={{ fontSize: '0.85rem', color: '#cbd5e1' }}>
-                  Match Confidence:
+                  Visual similarity:
                 </span>
                 <span style={{ fontSize: '0.9rem', fontWeight: 700, color: '#34d399' }}>
-                  {reviewConfidence === null ? 'Not available' : `${reviewConfidence}% Match`}
+                  {reviewConfidence === null ? 'Not available' : `${reviewConfidence}%`}
                 </span>
               </div>
 
@@ -1015,26 +1046,67 @@ export default function PeoplePetsView({ onSelectEntity, onOpenLightboxPhoto }) 
               </div>
 
               <div style={{ fontSize: '1.05rem', fontWeight: 600, color: '#ffffff', textAlign: 'center' }}>
-                Is this <span style={{ color: '#38bdf8' }}>{activeReviewItem.entity_name}</span>?
+                {activeReviewCandidates.length > 1
+                  ? 'Choose the best match, or tell LuminaPhoto none are right.'
+                  : <>Is this <span style={{ color: '#38bdf8' }}>{activeReviewItem.entity_name}</span>?</>}
               </div>
+              {activeReviewCandidates.length > 1 && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '8px', marginTop: '12px' }}>
+                  {activeReviewCandidates.map(({ entity, entity_id, score }) => (
+                    <button
+                      key={entity_id}
+                      className="btn-secondary"
+                      style={{ minHeight: '64px', display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: '8px', textAlign: 'left' }}
+                      onClick={() => handleConfirmSingle(activeReviewItem.id, entity_id)}
+                      disabled={isProcessingAction}
+                    >
+                    {entity.avatar_box_id ? (
+                      <img
+                        src={`/api/boxes/${entity.avatar_box_id}/crop`}
+                        alt=""
+                        style={{ width: '36px', height: '36px', flex: '0 0 36px', objectFit: 'cover', borderRadius: '50%' }}
+                      />
+                    ) : entity.entity_type === 'PET' ? <Heart size={20} /> : <User size={20} />}
+                    <span style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                      <span style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entity.name}</span>
+                      <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>
+                        {entity.entity_type === 'PET' ? 'Pet' : 'Person'} | {Math.round(score * 100)}% similarity
+                      </span>
+                    </span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Keyboard shortcut hint */}
             <div style={{ fontSize: '0.72rem', color: '#64748b', textAlign: 'center', margin: '0.75rem 0' }}>
-              Tip: Press <kbd style={{ background: '#1e293b', padding: '2px 6px', borderRadius: '4px' }}>Enter</kbd> to confirm, <kbd style={{ background: '#1e293b', padding: '2px 6px', borderRadius: '4px' }}>Backspace</kbd> to reject, or <kbd style={{ background: '#1e293b', padding: '2px 6px', borderRadius: '4px' }}>← / →</kbd> to browse.
+              Enter confirms a clear match; Backspace leaves the identity unassigned. Use the arrow keys to browse.
             </div>
 
             {/* Action Buttons */}
             <div style={{ display: 'flex', gap: '10px', justifyContent: 'space-between', marginTop: '0.5rem' }}>
-              <button
-                className="btn-secondary"
-                style={{ color: '#f87171', borderColor: 'rgba(239, 68, 68, 0.3)' }}
-                onClick={() => handleRejectSingle(activeReviewItem.id)}
-                disabled={isProcessingAction}
-              >
-                <X size={15} />
-                <span>Not {activeReviewItem.entity_name}</span>
-              </button>
+              {activeReviewCandidates.length > 1 ? (
+                <button
+                  className="btn-secondary"
+                  style={{ color: '#f87171', borderColor: 'rgba(239, 68, 68, 0.3)' }}
+                  onClick={() => handleMarkIdentityUnknown(activeReviewItem.id)}
+                  disabled={isProcessingAction}
+                >
+                  <X size={15} />
+                  <span>None of these</span>
+                </button>
+              ) : (
+                <button
+                  className="btn-secondary"
+                  style={{ color: '#f87171', borderColor: 'rgba(239, 68, 68, 0.3)' }}
+                  onClick={() => handleMarkIdentityUnknown(activeReviewItem.id)}
+                  disabled={isProcessingAction}
+                >
+                  <X size={15} />
+                  <span>{activeReviewCandidates.length > 1 ? 'None of these' : 'Not this identity'}</span>
+                </button>
+              )}
 
               <div style={{ display: 'flex', gap: '8px' }}>
                 <button

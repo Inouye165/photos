@@ -33,7 +33,9 @@ export default function BoundingBoxOverlay({
   isDrawMode = false,
   setIsDrawMode,
   selectedBoxId: externalSelectedBoxId,
-  onSelectBox
+  onSelectBox,
+  editBoxId,
+  onEditBoxHandled
 }) {
   const [boxes, setBoxes] = useState([]);
   const [entities, setEntities] = useState([]);
@@ -117,6 +119,21 @@ export default function BoundingBoxOverlay({
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  useEffect(() => {
+    if (!editBoxId) return;
+    const box = boxes.find((item) => item.id === editBoxId);
+    if (!box) return;
+
+    setSelectedBoxId(box.id);
+    if (!box.entity_name) {
+      setEditingBoxId(box.id);
+      setInputName('');
+      setSelectedType(box.box_type === 'PET' ? 'PET' : 'PERSON');
+      setShowSuggestions(true);
+    }
+    onEditBoxHandled?.();
+  }, [boxes, editBoxId, onEditBoxHandled, setSelectedBoxId]);
 
   // Handle Box Confirm / Reject
   const handleConfirm = async (boxId, e) => {
@@ -559,7 +576,8 @@ export default function BoundingBoxOverlay({
           const isPet = box.box_type === 'PET' || box.entity_type === 'PET';
 
           // Box body elevation: selected gets small elevation (+5), keeping smaller inner boxes above it
-          const boxZ = baseZ + (isSelected ? 5 : isHovered ? 2 : 0);
+          const identityPriority = box.entity_name ? 30 : 0;
+          const boxZ = baseZ + identityPriority + (isSelected ? 5 : isHovered ? 2 : 0);
 
           // Find any unassigned face box inside this box
           const innerUnassignedBoxes = boxes.filter((b) => {
@@ -592,6 +610,23 @@ export default function BoundingBoxOverlay({
           const matchPercent = box.match_confidence
             ? Math.round(box.match_confidence * 100)
             : null;
+          const popoverAbove = y + h > imgLayout.height * 0.58;
+          const candidateSuggestions = (() => {
+            try {
+              const candidates = JSON.parse(box.candidate_entities_json || '[]');
+              return Array.isArray(candidates)
+                ? candidates
+                  .slice(0, 3)
+                  .map((candidate) => ({
+                    ...candidate,
+                    entity: entities.find((entity) => entity.id === candidate.entity_id)
+                  }))
+                  .filter((candidate) => candidate.entity)
+                : [];
+            } catch {
+              return [];
+            }
+          })();
 
           return (
             <div
@@ -746,7 +781,8 @@ export default function BoundingBoxOverlay({
                 className="box-popover glass-card"
                 style={{
                   position: 'absolute',
-                  top: `${h + 6}px`,
+                  top: popoverAbove ? 'auto' : `${h + 6}px`,
+                  bottom: popoverAbove ? `${imgLayout.height - y + 30}px` : 'auto',
                   left: '0',
                   minWidth: '220px',
                   zIndex: 100,
@@ -833,7 +869,7 @@ export default function BoundingBoxOverlay({
                           setSelectedType(box.entity_type || 'PERSON');
                           setShowSuggestions(false);
                         }}
-                        title="Rename or change person"
+                        title="Correct this person or pet identity"
                       >
                         <Edit2 size={12} />
                       </button>
@@ -936,8 +972,49 @@ export default function BoundingBoxOverlay({
                 {(!box.entity_name || isEditing) && (
                   <div>
                     <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginBottom: '6px', fontWeight: 600 }}>
-                      {box.entity_name ? 'Edit Person or Pet' : 'Name this Person or Pet'}
+                      {box.entity_name ? 'Correct this identity' : 'Name this Person or Pet'}
                     </div>
+                    {box.entity_name && (
+                      <div style={{ fontSize: '0.7rem', color: '#94a3b8', marginBottom: '6px' }}>
+                        Saving the correct identity improves future match suggestions.
+                      </div>
+                    )}
+
+                    {candidateSuggestions.length > 0 && (
+                      <div style={{ marginBottom: '8px' }}>
+                        <div style={{ fontSize: '0.7rem', color: '#fbbf24', marginBottom: '4px', fontWeight: 600 }}>
+                          Likely matches
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                          {candidateSuggestions.map(({ entity, score }) => (
+                            <button
+                              key={entity.id}
+                              type="button"
+                              className="btn-secondary"
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                width: '100%',
+                                padding: '4px 7px',
+                                fontSize: '0.72rem',
+                                textAlign: 'left'
+                              }}
+                              onClick={() => {
+                                setInputName(entity.name);
+                                setSelectedType(entity.entity_type || 'PERSON');
+                                setShowSuggestions(false);
+                              }}
+                            >
+                              <span>{entity.name}</span>
+                              <span style={{ color: '#fbbf24', fontSize: '0.65rem' }}>
+                                {Math.round(Number(score) * 100)}%
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     {/* Entity Type Toggle */}
                     <div style={{ display: 'flex', gap: '4px', marginBottom: '8px' }}>
@@ -993,14 +1070,16 @@ export default function BoundingBoxOverlay({
                       />
                     </div>
 
-                    {/* Suggestions from existing entities - rendered in layout flow so it never covers action buttons */}
-                    {showSuggestions && inputName.trim().length > 0 && entities.length > 0 && (() => {
+                    {/* Existing names are available immediately and narrow as the user types. */}
+                    {showSuggestions && entities.length > 0 && (() => {
+                      const searchTerm = inputName.trim().toLowerCase();
                       const matched = entities
-                        .filter((ent) =>
-                          ent.name.toLowerCase().includes(inputName.trim().toLowerCase()) &&
-                          ent.name.toLowerCase() !== inputName.trim().toLowerCase()
-                        )
-                        .slice(0, 4);
+                        .filter((ent) => {
+                          const sameType = (ent.entity_type || 'PERSON') === selectedType;
+                          const differentName = ent.name.toLowerCase() !== searchTerm;
+                          return sameType && differentName && (!searchTerm || ent.name.toLowerCase().includes(searchTerm));
+                        })
+                        .slice(0, 6);
                       if (matched.length === 0) return null;
                       return (
                         <div
@@ -1014,6 +1093,9 @@ export default function BoundingBoxOverlay({
                             boxShadow: '0 4px 12px rgba(0,0,0,0.3)'
                           }}
                         >
+                          <div style={{ padding: '5px 8px', fontSize: '0.68rem', color: '#94a3b8', fontWeight: 600 }}>
+                            Known {selectedType === 'PET' ? 'pet names' : 'names'}
+                          </div>
                           {matched.map((ent) => (
                             <div
                               key={ent.id}
@@ -1061,7 +1143,10 @@ export default function BoundingBoxOverlay({
                           type="button"
                           className="btn-secondary"
                           style={{ padding: '3px 8px', fontSize: '0.72rem' }}
-                          onClick={() => setEditingBoxId(null)}
+                          onClick={() => {
+                            setEditingBoxId(null);
+                            setSelectedBoxId(null);
+                          }}
                         >
                           Cancel
                         </button>

@@ -397,11 +397,29 @@ export default function TrashView({ onSelectPhoto, onLibraryUpdated }) {
                       <RotateCcw size={13} />
                     </button>
 
-                    <div className="photo-badge-top-left">
+                    <div className="photo-badge-top-left" style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
                       <span className="badge-trash">
                         <Trash2 size={10} />
-                        <span>Tagged</span>
+                        <span>In Trash</span>
                       </span>
+                      {photo.gdrive_file_id && (
+                        <span
+                          style={{
+                            fontSize: '0.62rem',
+                            fontWeight: 600,
+                            padding: '2px 6px',
+                            borderRadius: '9999px',
+                            background: 'rgba(16, 185, 129, 0.85)',
+                            color: '#ffffff',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '3px'
+                          }}
+                          title="Backup copy is preserved in Google Drive Trash until you Empty Trash"
+                        >
+                          <span>Drive Backup Kept</span>
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -464,7 +482,8 @@ export default function TrashView({ onSelectPhoto, onLibraryUpdated }) {
               </h3>
             </div>
             <p style={{ fontSize: '0.875rem', color: '#cbd5e1', lineHeight: '1.5', marginBottom: '1rem' }}>
-              This will permanently delete <strong>{totalCount} photo(s)</strong> ({formatMb(totalBytes)}) from your storage drive.
+              This will permanently delete <strong>{totalCount} photo(s)</strong> ({formatMb(totalBytes)}) from your local storage drive{' '}
+              <strong>and permanently remove their backup copies from Google Drive</strong> (freeing storage space on both your PC and Google Drive).
               This action cannot be undone.
             </p>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>

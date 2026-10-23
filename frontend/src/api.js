@@ -430,15 +430,51 @@ export async function fetchBackupAuthUrl() {
   return res.json();
 }
 
-export async function exchangeBackupCode(code) {
+export async function exchangeBackupCode(code, state = null) {
   const res = await fetch(`${API_BASE}/backup/auth/exchange`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code })
+    body: JSON.stringify({ code, state })
   });
   if (!res.ok) {
     const errorData = await res.json().catch(() => ({}));
     throw new Error(errorData.detail || 'Failed to exchange code');
+  }
+  return res.json();
+}
+
+export async function uploadBackupCredentials(file) {
+  const formData = new FormData();
+  formData.append('file', file);
+  const res = await fetch(`${API_BASE}/backup/credentials`, {
+    method: 'POST',
+    body: formData
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || 'Failed to upload credentials file');
+  }
+  return res.json();
+}
+
+export async function triggerBackupSyncNow(retryFailed = false) {
+  const res = await fetch(`${API_BASE}/backup/sync-now`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ retry_failed: retryFailed })
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || 'Failed to trigger sync');
+  }
+  return res.json();
+}
+
+export async function verifyBackupIntegrity() {
+  const res = await fetch(`${API_BASE}/backup/verify`, { method: 'POST' });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || 'Failed to verify backups');
   }
   return res.json();
 }

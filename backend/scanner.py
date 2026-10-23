@@ -97,6 +97,67 @@ class ScanManager:
                 daemon=True
             )
             self.worker_thread.start()
+            try:
+                from backend.folder_watcher import FolderWatcherManager
+                FolderWatcherManager.get_instance().add_watch_path(self.current_root)
+            except Exception:
+                pass
+            return True
+
+    def start_embedding_backfill(self) -> bool:
+        """Runs a lightweight background pass to generate missing CLIP embeddings from cached thumbnails."""
+        with self._lock:
+            if self.is_scanning:
+                return False
+            conn = get_connection()
+            try:
+                rows = conn.execute(
+                    "SELECT id, file_path FROM photos "
+                    "WHERE classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO') AND is_trashed = 0 AND has_embedding = 0"
+                ).fetchall()
+                need_embeddings = [(r["id"], r["file_path"]) for r in rows]
+            finally:
+                conn.close()
+
+            if not need_embeddings:
+                return False
+
+            self.is_scanning = True
+            self.should_stop = False
+            self.stats = {
+                "status": "EMBEDDING",
+                "current_file": f"Indexing {len(need_embeddings)} photos for semantic search...",
+                "total_found": len(need_embeddings),
+                "processed_count": 0,
+                "photos_count": len(need_embeddings),
+                "screenshots_count": 0,
+                "system_assets_count": 0,
+                "duplicates_count": 0,
+                "embeddings_count": 0,
+                "error_message": None,
+                "start_time": time.time(),
+                "elapsed_seconds": 0
+            }
+
+            def _backfill_worker(items):
+                try:
+                    vector_engine = VectorEngine.get_instance()
+                    def update_emb_progress(indexed, total):
+                        with self._lock:
+                            self.stats["embeddings_count"] = indexed
+                            self.stats["processed_count"] = indexed
+                            self.stats["current_file"] = f"Embedding photo {indexed} of {total}..."
+                    vector_engine.batch_index_photos(items, batch_size=32, progress_callback=update_emb_progress)
+                except Exception:
+                    pass
+                finally:
+                    with self._lock:
+                        self.stats["status"] = "COMPLETED"
+                        self.stats["current_file"] = f"Semantic search index updated ({self.stats['embeddings_count']} photos)."
+                        self.is_scanning = False
+
+            self.worker_thread = threading.Thread(target=_backfill_worker, args=(need_embeddings,), daemon=True)
+            self.worker_thread.start()
             return True
 
     def stop_scan(self):
@@ -125,6 +186,26 @@ class ScanManager:
         with self._lock:
             self.stats["total_found"] = len(all_candidate_files)
 
+        # Preload existing indexed records to skip redundant full-file hashing on unchanged files
+        existing_records = {}
+        try:
+            conn = get_connection()
+            rows = conn.execute(
+                "SELECT id, file_path, file_size, file_modified_at, classification, sha256, phash FROM photos"
+            ).fetchall()
+            conn.close()
+            for r in rows:
+                existing_records[os.path.abspath(r["file_path"])] = (
+                    r["id"],
+                    r["file_size"],
+                    r["file_modified_at"],
+                    r["classification"],
+                    r["sha256"],
+                    r["phash"]
+                )
+        except Exception:
+            pass
+
         newly_indexed_photos = []
 
         # 2. Extract metadata, classify, and generate thumbnails in parallel
@@ -132,6 +213,27 @@ class ScanManager:
             if self.should_stop:
                 return None
             try:
+                abs_fpath = os.path.abspath(fpath)
+                existing = existing_records.get(abs_fpath)
+                if existing is not None:
+                    ex_id, ex_size, ex_mtime, ex_class, ex_sha, ex_phash = existing
+                    try:
+                        st = os.stat(abs_fpath)
+                        if (
+                            ex_sha
+                            and ex_phash
+                            and ex_class
+                            and st.st_size == ex_size
+                            and ex_mtime is not None
+                            and abs(st.st_mtime - float(ex_mtime)) < 1.0
+                        ):
+                            if ex_class in ("VERIFIED_PHOTO", "LIKELY_PHOTO", "SCREENSHOT", "SYSTEM_ASSET"):
+                                generate_thumbnail(abs_fpath, ex_id, "thumb")
+                                generate_thumbnail(abs_fpath, ex_id, "preview")
+                            return (ex_id, abs_fpath, ex_class)
+                    except Exception:
+                        pass
+
                 meta = extract_metadata(fpath)
                 classification, score, reason = classify_media(meta)
                 
@@ -230,3 +332,10 @@ class ScanManager:
             self.stats["status"] = "COMPLETED"
             self.stats["current_file"] = f"Scan complete. Indexed {self.stats['photos_count']} photos."
             self.is_scanning = False
+
+        if newly_indexed_photos:
+            try:
+                from backend.backup_worker import BackupWorker
+                BackupWorker.get_instance().trigger_wake()
+            except Exception:
+                pass
