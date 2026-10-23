@@ -36,6 +36,7 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
   const [photoBoxes, setPhotoBoxes] = useState([]);
   const [isDrawMode, setIsDrawMode] = useState(false);
   const [selectedBoxId, setSelectedBoxId] = useState(null);
+  const [editRequestedBoxId, setEditRequestedBoxId] = useState(null);
 
   const handleBoxesUpdated = useCallback((boxes) => {
     if (Array.isArray(boxes)) {
@@ -176,21 +177,23 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
               }}
               onClick={handleToggleTrash}
               disabled={isUpdating}
-              title={isTrashed ? 'Restore photo from trash' : 'Tag photo for trash (file remains intact)'}
+              title={isTrashed ? 'Restore photo from trash (and untrash on Google Drive)' : 'Soft-delete: move photo to Trash (keeps backup until Trash is emptied)'}
             >
               {isTrashed ? <RotateCcw size={14} /> : <Trash2 size={14} />}
-              <span className="hide-on-mobile">{isTrashed ? 'Restore Photo' : 'Tag for Trash'}</span>
+              <span className="hide-on-mobile">{isTrashed ? 'Restore Photo' : 'Move to Trash'}</span>
             </button>
 
-            <button
-              className="btn-secondary"
-              style={{ fontSize: '0.8rem', padding: '0.4rem 0.75rem', color: '#94a3b8' }}
-              onClick={() => setShowDeleteConfirm(true)}
-              title="Immediately move file to Recycle Bin"
-            >
-              <Trash2 size={14} />
-              <span className="hide-on-mobile">Delete Now</span>
-            </button>
+            {isTrashed && (
+              <button
+                className="btn-secondary"
+                style={{ fontSize: '0.8rem', padding: '0.4rem 0.75rem', color: '#f87171', borderColor: 'rgba(239, 68, 68, 0.4)' }}
+                onClick={() => setShowDeleteConfirm(true)}
+                title="Permanently delete from disk and Google Drive now"
+              >
+                <Trash2 size={14} />
+                <span className="hide-on-mobile">Delete Permanently</span>
+              </button>
+            )}
 
             <a
               href={originalUrl}
@@ -297,6 +300,8 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
               setIsDrawMode={setIsDrawMode}
               selectedBoxId={selectedBoxId}
               onSelectBox={setSelectedBoxId}
+              editBoxId={editRequestedBoxId}
+              onEditBoxHandled={() => setEditRequestedBoxId(null)}
             />
           )}
         </div>
@@ -332,7 +337,10 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
               {photoBoxes.map((box) => (
                 <div
                   key={box.id}
-                  onClick={() => setSelectedBoxId(box.id)}
+                  onClick={() => {
+                    setSelectedBoxId(box.id);
+                    if (!box.entity_name) setEditRequestedBoxId(box.id);
+                  }}
                   style={{
                     display: 'flex',
                     alignItems: 'center',
@@ -498,19 +506,42 @@ export default function Lightbox({ photo, onClose, onReclassifySuccess, onPhotoD
               style={{
                 color: details.gdrive_backup_status === 'backed_up'
                   ? '#34d399'
+                  : details.gdrive_backup_status === 'trashed'
+                  ? '#fbbf24'
                   : details.gdrive_backup_status === 'uploading'
                   ? '#38bdf8'
+                  : details.gdrive_backup_status === 'failed'
+                  ? '#f87171'
                   : '#94a3b8',
                 fontWeight: 600
               }}
             >
               {details.gdrive_backup_status === 'backed_up'
-                ? '✓ Backed Up'
+                ? '✓ Backed Up on Drive'
+                : details.gdrive_backup_status === 'trashed'
+                ? 'In Drive Trash (Protected)'
                 : details.gdrive_backup_status === 'uploading'
                 ? 'Uploading...'
-                : 'Pending'}
+                : details.gdrive_backup_status === 'failed'
+                ? 'Backup Failed'
+                : 'Pending Backup'}
             </span>
           </div>
+          {details.gdrive_file_id && (
+            <div className="exif-row">
+              <span className="exif-label">Cloud Copy</span>
+              <a
+                href={`https://drive.google.com/file/d/${details.gdrive_file_id}/view`}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: '#38bdf8', fontSize: '0.78rem', display: 'inline-flex', alignItems: 'center', gap: '4px', textDecoration: 'none' }}
+                title="Open this exact backed-up file in Google Drive"
+              >
+                <span>View on Google Drive</span>
+                <ExternalLink size={11} />
+              </a>
+            </div>
+          )}
           {details.gdrive_backed_up_at && (
             <div className="exif-row">
               <span className="exif-label">Backed Up At</span>

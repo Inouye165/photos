@@ -33,8 +33,10 @@ backend/.oauth_verifier.json
 *.pt
 
 # Node / Frontend
+node_modules/
 frontend/node_modules/
 frontend/dist/
+frontend/.vitest/
 frontend/.oxlintrc.json
 
 # Operating System

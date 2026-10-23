@@ -5,14 +5,17 @@ Completely decoupled from photo endpoints.
 """
 
 import os
+import ipaddress
+import subprocess
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, HTTPException, Query, Body
+from fastapi import APIRouter, HTTPException, Query, Body, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from backend.documents_db import (
     get_documents,
     get_document_by_id,
+    get_document_by_original_path,
     get_document_stats,
     delete_document,
     clear_all_documents,
@@ -35,7 +38,8 @@ from backend.documents_scanner import (
     get_default_scan_roots,
     get_allowed_document_roots,
     is_path_in_allowed_document_roots,
-    DEFAULT_DOCUMENTS_LIBRARY
+    DEFAULT_DOCUMENTS_LIBRARY,
+    PERSONAL_DOC_EXTENSIONS
 )
 from backend.documents_vector import DocumentVectorEngine
 from backend.documents_watcher import DocumentWatcherManager
@@ -65,29 +69,87 @@ class ReviewRequest(BaseModel):
 class AnalyzeRequest(BaseModel):
     model: Optional[str] = None
 
+def _require_loopback(request: Request):
+    """Restricts host GUI and desktop shell operations to loopback clients."""
+    client_host = request.client.host if request.client else ""
+    try:
+        is_local = ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        is_local = client_host in ("testclient", "localhost")
+    if not is_local:
+        raise HTTPException(status_code=403, detail="This action is restricted to the local computer.")
+
+
+def _is_safe_local_path(path: str) -> bool:
+    """Rejects UNC network shares and verifies path is local."""
+    if not path or not isinstance(path, str):
+        return False
+    stripped = path.strip()
+    if stripped.startswith("\\\\") or stripped.startswith("//"):
+        return False
+    return True
+
+
+def _is_allowed_reveal_path(norm_path: str) -> bool:
+    """Checks if a path is within allowed document directories, workspace libraries, or indexed in DB."""
+    if not _is_safe_local_path(norm_path):
+        return False
+    if is_path_in_allowed_document_roots(norm_path):
+        return True
+    try:
+        real_target = os.path.realpath(norm_path)
+        for allowed_base in (DEFAULT_DOCUMENTS_LIBRARY, DEFAULT_DOCUMENTS_TRASH):
+            real_base = os.path.realpath(allowed_base)
+            if os.path.commonpath([real_base, real_target]) == real_base:
+                return True
+    except ValueError:
+        pass
+    if get_document_by_original_path(norm_path) is not None:
+        return True
+    return False
+
+
+def _launch_explorer(norm_path: str, select_file: bool = False):
+    """Safely opens Windows Explorer using an argument list without shell interpolation."""
+    if not _is_safe_local_path(norm_path):
+        raise HTTPException(status_code=400, detail="Network UNC paths are not permitted")
+    if select_file:
+        subprocess.Popen(["explorer.exe", f"/select,{norm_path}"])
+    else:
+        subprocess.Popen(["explorer.exe", norm_path])
+
+
 def pick_folder_explorer(initial_dir: Optional[str] = None) -> Optional[str]:
     """
     Opens native Windows Explorer folder selection dialog.
     Runs via isolated PowerShell process to ensure native Windows Explorer appearance.
     """
-    import subprocess
     import sys
 
+    safe_init = ""
+    if initial_dir and _is_safe_local_path(initial_dir):
+        norm_init = os.path.normpath(os.path.abspath(initial_dir))
+        if os.path.exists(norm_init) and os.path.isdir(norm_init):
+            safe_init = norm_init
+
+    env = os.environ.copy()
+    env["LUMINA_INIT_DIR"] = safe_init
+
     # Try PowerShell first for modern Windows Explorer folder picker
-    init_path = initial_dir.replace("'", "''") if initial_dir and os.path.exists(initial_dir) else ""
-    initial_code = f"$f.SelectedPath = '{init_path}'" if init_path else ""
-    ps_cmd = f"""
+    ps_cmd = """
     Add-Type -AssemblyName System.Windows.Forms
     $f = New-Object System.Windows.Forms.FolderBrowserDialog
     $f.Description = 'Select a folder to scan for personal documents'
     $f.AutoUpgradeEnabled = $true
     $f.ShowNewFolderButton = $false
-    {initial_code}
+    if ($env:LUMINA_INIT_DIR -and (Test-Path -LiteralPath $env:LUMINA_INIT_DIR)) {
+        $f.SelectedPath = $env:LUMINA_INIT_DIR
+    }
     $res = $f.ShowDialog()
-    if ($res -eq [System.Windows.Forms.DialogResult]::OK) {{
+    if ($res -eq [System.Windows.Forms.DialogResult]::OK) {
         [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
         Write-Output $f.SelectedPath
-    }}
+    }
     """
     try:
         proc = subprocess.run(
@@ -95,23 +157,26 @@ def pick_folder_explorer(initial_dir: Optional[str] = None) -> Optional[str]:
             capture_output=True,
             text=True,
             encoding="utf-8",
+            env=env,
             timeout=180
         )
         selected = proc.stdout.strip()
-        if selected and os.path.exists(selected):
+        if selected and _is_safe_local_path(selected) and os.path.exists(selected):
             return selected
     except Exception as e:
         print(f"[DocumentsPicker] PowerShell dialog error: {e}")
 
     # Fallback to Tkinter subprocess
     try:
-        script = f"""
+        script = """
+import os
 import tkinter as tk
 from tkinter import filedialog
 root = tk.Tk()
 root.withdraw()
 root.attributes('-topmost', True)
-path = filedialog.askdirectory(initialdir={repr(initial_dir or '')}, title='Select a folder to scan for personal documents')
+init_dir = os.environ.get('LUMINA_INIT_DIR', '')
+path = filedialog.askdirectory(initialdir=init_dir, title='Select a folder to scan for personal documents')
 root.destroy()
 if path:
     print(path)
@@ -121,10 +186,11 @@ if path:
             capture_output=True,
             text=True,
             encoding="utf-8",
+            env=env,
             timeout=180
         )
         selected = proc.stdout.strip()
-        if selected and os.path.exists(selected):
+        if selected and _is_safe_local_path(selected) and os.path.exists(selected):
             return selected
     except Exception as e:
         print(f"[DocumentsPicker] Tkinter fallback error: {e}")
@@ -132,8 +198,9 @@ if path:
     return None
 
 @router.post("/pick-folder")
-def pick_folder_endpoint(req: PickFolderRequest = Body(default=PickFolderRequest())):
+def pick_folder_endpoint(request: Request, req: PickFolderRequest = Body(default=PickFolderRequest())):
     """Opens a native Windows Explorer folder selection dialog."""
+    _require_loopback(request)
     folder = pick_folder_explorer(req.initial_dir)
     return {"folder_path": folder, "selected": bool(folder)}
 
@@ -298,10 +365,19 @@ def start_scan(req: ScanRequest = Body(default=ScanRequest())):
     elif req.custom_roots:
         roots = [r.strip() for r in req.custom_roots if r.strip()]
 
+    if req.target_library:
+        norm_target = os.path.normpath(os.path.abspath(req.target_library))
+        norm_default = os.path.normpath(os.path.abspath(DEFAULT_DOCUMENTS_LIBRARY))
+        if norm_target.lower() != norm_default.lower():
+            raise HTTPException(
+                status_code=400,
+                detail="Custom target library paths are not permitted outside the default documents library."
+            )
+
     try:
         started = manager.start_scan(
             custom_roots=roots,
-            target_library=req.target_library,
+            target_library=DEFAULT_DOCUMENTS_LIBRARY,
             recursive=req.recursive
         )
     except ValueError as e:
@@ -391,12 +467,17 @@ def get_document_file(doc_id: int):
         file_path,
         media_type=media_type,
         content_disposition_type="inline",
-        filename=doc["file_name"]
+        filename=doc["file_name"],
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        }
     )
 
 @router.post("/{doc_id}/open-system")
-def open_in_system_app(doc_id: int):
+def open_in_system_app(doc_id: int, request: Request):
     """Opens the document file in Windows default application (Word, Acrobat, Excel, etc.)."""
+    _require_loopback(request)
     doc = get_document_by_id(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -406,6 +487,11 @@ def open_in_system_app(doc_id: int):
         file_path = doc["original_path"]
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Document file not found on disk")
+    if not _is_safe_local_path(file_path):
+        raise HTTPException(status_code=400, detail="Network UNC paths are not permitted")
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in PERSONAL_DOC_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported document extension for system launch")
 
     try:
         os.startfile(file_path)
@@ -417,65 +503,69 @@ class RevealPathRequest(BaseModel):
     path: str
 
 @router.post("/reveal-path")
-def reveal_path_endpoint(req: RevealPathRequest):
+def reveal_path_endpoint(req: RevealPathRequest, request: Request):
     """Opens Windows Explorer highlighting a path or opening its directory."""
+    _require_loopback(request)
     raw = req.path.strip()
     if not raw:
         raise HTTPException(status_code=400, detail="Path cannot be empty")
-    norm = os.path.normpath(raw)
-    import subprocess
+    if not _is_safe_local_path(raw):
+        raise HTTPException(status_code=400, detail="Network UNC paths are not permitted")
+    norm = os.path.normpath(os.path.abspath(raw))
+    if not _is_allowed_reveal_path(norm):
+        raise HTTPException(status_code=403, detail="Forbidden: Path is outside allowed document directories")
     if os.path.isfile(norm):
-        subprocess.Popen(f'explorer /select,"{norm}"')
+        _launch_explorer(norm, select_file=True)
         return {"success": True, "mode": "file_select", "path": norm}
     elif os.path.isdir(norm):
-        subprocess.Popen(f'explorer "{norm}"')
+        _launch_explorer(norm, select_file=False)
         return {"success": True, "mode": "folder_open", "path": norm}
     elif os.path.exists(os.path.dirname(norm)):
         parent = os.path.dirname(norm)
-        subprocess.Popen(f'explorer "{parent}"')
+        _launch_explorer(parent, select_file=False)
         return {"success": True, "mode": "parent_open", "path": parent}
     raise HTTPException(status_code=404, detail=f"Path not found on disk: {norm}")
 
 @router.post("/{doc_id}/reveal")
-def reveal_in_explorer(doc_id: int):
+def reveal_in_explorer(doc_id: int, request: Request):
     """Opens Windows Explorer with this document highlighted, or opens its containing folder."""
+    _require_loopback(request)
     doc = get_document_by_id(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     
-    import subprocess
     orig_path = doc.get("original_path")
     if orig_path and os.path.exists(orig_path):
         norm = os.path.normpath(orig_path)
-        subprocess.Popen(f'explorer /select,"{norm}"')
+        _launch_explorer(norm, select_file=True)
         return {"success": True, "mode": "file_select", "path": norm}
 
     copy_path = doc.get("copied_path")
     if copy_path and os.path.exists(copy_path):
         norm = os.path.normpath(copy_path)
-        subprocess.Popen(f'explorer /select,"{norm}"')
+        _launch_explorer(norm, select_file=True)
         return {"success": True, "mode": "file_select", "path": norm}
 
     if orig_path:
         parent_dir = os.path.dirname(orig_path)
         if os.path.exists(parent_dir):
             norm = os.path.normpath(parent_dir)
-            subprocess.Popen(f'explorer "{norm}"')
+            _launch_explorer(norm, select_file=False)
             return {"success": True, "mode": "folder_open", "path": norm}
 
     if copy_path:
         parent_dir = os.path.dirname(copy_path)
         if os.path.exists(parent_dir):
             norm = os.path.normpath(parent_dir)
-            subprocess.Popen(f'explorer "{norm}"')
+            _launch_explorer(norm, select_file=False)
             return {"success": True, "mode": "folder_open", "path": norm}
 
     raise HTTPException(status_code=404, detail="Neither document file nor containing folder was found on disk")
 
 @router.post("/{doc_id}/open-folder")
-def open_document_folder(doc_id: int):
+def open_document_folder(doc_id: int, request: Request):
     """Explicitly opens the folder containing this document in Windows Explorer."""
-    return reveal_in_explorer(doc_id)
+    return reveal_in_explorer(doc_id, request)
 
 @router.post("/{doc_id}/trash")
 def trash_document_endpoint(doc_id: int):
@@ -515,14 +605,14 @@ def empty_trash_endpoint():
     return {"success": True, "purged_count": count, "message": f"Purged {count} document(s) from trash"}
 
 @router.post("/trash/open-folder")
-def open_trash_folder_endpoint():
+def open_trash_folder_endpoint(request: Request):
     """
     Opens the workspace documents_trash holding folder in native Windows Explorer.
     """
-    import subprocess
+    _require_loopback(request)
     os.makedirs(DEFAULT_DOCUMENTS_TRASH, exist_ok=True)
     norm_path = os.path.normpath(DEFAULT_DOCUMENTS_TRASH)
-    subprocess.Popen(f'explorer "{norm_path}"')
+    _launch_explorer(norm_path, select_file=False)
     return {"success": True, "path": norm_path}
 
 @router.delete("/{doc_id}")

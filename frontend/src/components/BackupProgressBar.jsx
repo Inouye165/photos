@@ -14,12 +14,17 @@ import {
   Clock,
   RotateCcw,
   RefreshCw,
-  FileCode
+  FileCode,
+  Upload,
+  Zap
 } from 'lucide-react';
 import {
   fetchBackupStatus,
   fetchBackupAuthUrl,
   exchangeBackupCode,
+  uploadBackupCredentials,
+  triggerBackupSyncNow,
+  verifyBackupIntegrity,
   startBackupAuth,
   disconnectBackup,
   pauseBackup,
@@ -34,16 +39,22 @@ export default function BackupProgressBar() {
   const [isUpdating, setIsUpdating] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [isCheckingConfig, setIsCheckingConfig] = useState(false);
+  const [isUploadingCreds, setIsUploadingCreds] = useState(false);
+  const [isSyncingNow, setIsSyncingNow] = useState(false);
+  const [isVerifying, setIsVerifying] = useState(false);
   const [actionError, setActionError] = useState('');
   const [isRetrying, setIsRetrying] = useState(false);
   const [directAuthUrl, setDirectAuthUrl] = useState('');
+  const [authState, setAuthState] = useState(null);
   const [manualCode, setManualCode] = useState('');
   const [isExchangingCode, setIsExchangingCode] = useState(false);
   const [successBanner, setSuccessBanner] = useState('');
   const [copiedLink, setCopiedLink] = useState(false);
   const [editLimit, setEditLimit] = useState(25);
   const [editDelay, setEditDelay] = useState(30);
+  const [editFolderName, setEditFolderName] = useState('LuminaPhoto Backup');
   const popoverRef = useRef(null);
+  const credsFileInputRef = useRef(null);
   const hasInitializedInputs = useRef(false);
 
   const loadStatus = async () => {
@@ -53,6 +64,7 @@ export default function BackupProgressBar() {
       if (data && !hasInitializedInputs.current) {
         setEditLimit(data.hourly_limit || 25);
         setEditDelay(data.delay_seconds || 30);
+        setEditFolderName(data.root_folder_name || data.stats?.root_folder_name || 'LuminaPhoto Backup');
         hasInitializedInputs.current = true;
       }
       return data;
@@ -71,6 +83,19 @@ export default function BackupProgressBar() {
       setIsOpen(true);
       loadStatus();
     }
+
+    // Listen for popup OAuth completion message
+    const handleMessage = (event) => {
+      if (event.origin !== window.location.origin) return;
+      if (event.data && event.data.type === 'LUMINA_GDRIVE_CONNECTED') {
+        setSuccessBanner('✓ Google Drive linked! Background backup has started.');
+        setActionError('');
+        setIsConnecting(false);
+        loadStatus();
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
   }, []);
 
   // Live polling: refresh status every 2.5s when popover open, every 8s in background
@@ -99,6 +124,7 @@ export default function BackupProgressBar() {
     stats,
     status,
     current_file,
+    current_file_progress = 0,
     uploads_this_hour,
     hourly_limit,
     is_paused,
@@ -117,12 +143,31 @@ export default function BackupProgressBar() {
       if (data && data.is_configured) {
         setSuccessBanner('✓ credentials.json detected! Click "Authorize Google Drive" below.');
       } else {
-        setActionError('credentials.json was not found in backend/. Please make sure the file is saved as photos/backend/credentials.json and check again.');
+        setActionError('credentials.json was not found in backend/. Use "Import OAuth JSON File" above or place it at photos/backend/credentials.json.');
       }
     } catch (err) {
       setActionError('Error checking configuration: ' + err.message);
     } finally {
       setIsCheckingConfig(false);
+    }
+  };
+
+  const handleCredentialsFileChange = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setIsUploadingCreds(true);
+    setActionError('');
+    try {
+      await uploadBackupCredentials(file);
+      setSuccessBanner('✓ OAuth credentials imported! Click "Authorize Google Drive" below.');
+      await loadStatus();
+    } catch (err) {
+      setActionError(err.message || 'Invalid credentials JSON file.');
+    } finally {
+      setIsUploadingCreds(false);
+      if (credsFileInputRef.current) {
+        credsFileInputRef.current.value = '';
+      }
     }
   };
 
@@ -133,16 +178,29 @@ export default function BackupProgressBar() {
       const data = await fetchBackupAuthUrl();
       if (data && data.auth_url) {
         setDirectAuthUrl(data.auth_url);
-        // Direct browser navigation to Google authorization page
-        window.location.href = data.auth_url;
+        if (data.state) {
+          setAuthState(data.state);
+        }
+        // Open centered popup window so the user doesn't lose their place in the gallery
+        const width = 540;
+        const height = 680;
+        const left = window.screenX + Math.max(0, (window.outerWidth - width) / 2);
+        const top = window.screenY + Math.max(0, (window.outerHeight - height) / 2);
+        const popup = window.open(
+          data.auth_url,
+          'LuminaGDriveAuth',
+          `width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`
+        );
+        if (!popup || popup.closed || typeof popup.closed === 'undefined') {
+          // Fallback to full-page navigation if popup was blocked
+          window.location.href = data.auth_url;
+        }
       }
     } catch (e) {
-      // If error is about missing credentials, display clearly
       if (e.message && e.message.includes('credentials.json')) {
         setActionError(e.message);
         loadStatus();
       } else {
-        // Fallback: trigger background server launcher
         try {
           await startBackupAuth();
           setTimeout(loadStatus, 2000);
@@ -162,7 +220,13 @@ export default function BackupProgressBar() {
     setIsExchangingCode(true);
     setActionError('');
     try {
-      await exchangeBackupCode(manualCode.trim());
+      let stateToken = authState;
+      if (!stateToken) {
+        const urlData = await fetchBackupAuthUrl();
+        stateToken = urlData.state;
+        setAuthState(stateToken);
+      }
+      await exchangeBackupCode(manualCode.trim(), stateToken);
       setSuccessBanner('✓ Google Drive linked successfully!');
       setManualCode('');
       await loadStatus();
@@ -180,12 +244,41 @@ export default function BackupProgressBar() {
         const data = await fetchBackupAuthUrl();
         url = data.auth_url;
         setDirectAuthUrl(url);
+        if (data.state) setAuthState(data.state);
       }
       await navigator.clipboard.writeText(url);
       setCopiedLink(true);
       setTimeout(() => setCopiedLink(false), 3000);
     } catch (err) {
       alert('Please copy manually: ' + directAuthUrl);
+    }
+  };
+
+  const handleSyncNow = async () => {
+    setIsSyncingNow(true);
+    setActionError('');
+    try {
+      await triggerBackupSyncNow(stats?.failed_count > 0);
+      await loadStatus();
+    } catch (err) {
+      setActionError('Failed to trigger sync: ' + err.message);
+    } finally {
+      setIsSyncingNow(false);
+    }
+  };
+
+  const handleVerifyBackups = async () => {
+    setIsVerifying(true);
+    setActionError('');
+    setSuccessBanner('');
+    try {
+      const report = await verifyBackupIntegrity();
+      setSuccessBanner(`✓ ${report.message}`);
+      await loadStatus();
+    } catch (err) {
+      setActionError('Verification failed: ' + err.message);
+    } finally {
+      setIsVerifying(false);
     }
   };
 
@@ -220,11 +313,15 @@ export default function BackupProgressBar() {
     try {
       const updated = await updateBackupSettings({
         hourly_limit: parseInt(editLimit, 10),
-        delay_seconds: parseFloat(editDelay)
+        delay_seconds: parseFloat(editDelay),
+        root_folder_name: editFolderName.trim() || 'LuminaPhoto Backup'
       });
       if (updated) {
         setEditLimit(updated.hourly_limit);
         setEditDelay(updated.delay_seconds);
+        if (updated.root_folder_name) {
+          setEditFolderName(updated.root_folder_name);
+        }
         hasInitializedInputs.current = true;
       }
       await loadStatus();
@@ -438,28 +535,40 @@ export default function BackupProgressBar() {
                     In <strong>Credentials</strong>, click <em>Create Credentials</em> &rarr; <em>OAuth client ID</em> (Type: <strong>Desktop app</strong>).
                   </li>
                   <li>
-                    Download client JSON, rename to <strong>credentials.json</strong>, and place it at:
+                    Download the client JSON file and import it below (or place it at <code>photos/backend/credentials.json</code>):
                   </li>
                 </ol>
 
-                <div
+                <input
+                  ref={credsFileInputRef}
+                  type="file"
+                  accept=".json,application/json"
+                  onChange={handleCredentialsFileChange}
+                  style={{ display: 'none' }}
+                />
+                <button
+                  type="button"
+                  onClick={() => credsFileInputRef.current?.click()}
+                  disabled={isUploadingCreds}
                   style={{
-                    padding: '6px 8px',
-                    background: 'rgba(0, 0, 0, 0.45)',
-                    border: '1px solid rgba(255, 255, 255, 0.08)',
-                    borderRadius: '6px',
-                    fontFamily: 'monospace',
-                    fontSize: '10.5px',
-                    color: '#67e8f9',
-                    wordBreak: 'break-all',
+                    width: '100%',
                     display: 'flex',
                     alignItems: 'center',
-                    gap: '6px'
+                    justifyContent: 'center',
+                    gap: '6px',
+                    padding: '8px 10px',
+                    background: 'rgba(56, 189, 248, 0.18)',
+                    border: '1px solid rgba(56, 189, 248, 0.45)',
+                    borderRadius: '6px',
+                    color: '#7dd3fc',
+                    fontSize: '11.5px',
+                    fontWeight: 600,
+                    cursor: isUploadingCreds ? 'wait' : 'pointer'
                   }}
                 >
-                  <FileCode size={13} style={{ flexShrink: 0, color: '#38bdf8' }} />
-                  <span>photos/backend/credentials.json</span>
-                </div>
+                  <Upload size={13} />
+                  <span>{isUploadingCreds ? 'Importing JSON...' : 'Import Downloaded OAuth JSON File'}</span>
+                </button>
               </div>
 
               {actionError && (
@@ -714,11 +823,58 @@ export default function BackupProgressBar() {
                     {uploads_this_hour} / {hourly_limit} max
                   </span>
                 </div>
+                {stats?.trashed_backed_up_count > 0 && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                    <span style={{ color: '#94a3b8' }}>In Trash (Backup Kept)</span>
+                    <span style={{ fontWeight: 500, color: '#fbbf24' }}>
+                      {stats.trashed_backed_up_count.toLocaleString()} photo(s)
+                    </span>
+                  </div>
+                )}
+                {stats?.pending_permanent_deletes > 0 && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                    <span style={{ color: '#94a3b8' }}>Drive Purge Queue</span>
+                    <span style={{ fontWeight: 500, color: '#f87171' }}>
+                      {stats.pending_permanent_deletes} pending
+                    </span>
+                  </div>
+                )}
+                {state.drive_quota && state.drive_quota.limit_gb > 0 && (
+                  <div style={{ marginTop: '6px', paddingTop: '6px', borderTop: '1px solid rgba(255,255,255,0.06)', fontSize: '11.5px' }}>
+                    {state.drive_quota.email && (
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                        <span style={{ color: '#94a3b8' }}>Account</span>
+                        <span style={{ color: '#cbd5e1', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          {state.drive_quota.email}
+                        </span>
+                      </div>
+                    )}
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span style={{ color: '#94a3b8' }}>Google Drive Space</span>
+                      <span style={{ color: '#38bdf8', fontWeight: 600 }}>
+                        {state.drive_quota.free_gb} GB free / {state.drive_quota.limit_gb} GB
+                      </span>
+                    </div>
+                  </div>
+                )}
                 {current_file ? (
                   <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
-                    <span style={{ fontSize: '11px', color: '#94a3b8' }}>Current upload:</span>
-                    <div style={{ fontSize: '12px', color: '#38bdf8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#94a3b8' }}>
+                      <span>Current upload:</span>
+                      {current_file_progress > 0 && <span>{current_file_progress}%</span>}
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#38bdf8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', marginBottom: '4px' }}>
                       {current_file}
+                    </div>
+                    <div style={{ width: '100%', height: '3px', background: 'rgba(255,255,255,0.08)', borderRadius: '2px', overflow: 'hidden' }}>
+                      <div
+                        style={{
+                          width: `${Math.max(5, current_file_progress)}%`,
+                          height: '100%',
+                          background: '#38bdf8',
+                          transition: 'width 0.3s ease'
+                        }}
+                      />
                     </div>
                   </div>
                 ) : state.status_message ? (
@@ -733,6 +889,33 @@ export default function BackupProgressBar() {
 
               {/* Action Controls */}
               <div style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
+                {!is_paused && stats?.pending_count > 0 && status !== 'uploading' && (
+                  <button
+                    type="button"
+                    onClick={handleSyncNow}
+                    disabled={isSyncingNow || isUpdating}
+                    style={{
+                      flex: 1,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '5px',
+                      padding: '7px 10px',
+                      background: 'rgba(56, 189, 248, 0.16)',
+                      border: '1px solid rgba(56, 189, 248, 0.35)',
+                      borderRadius: '6px',
+                      color: '#38bdf8',
+                      fontSize: '12px',
+                      fontWeight: 600,
+                      cursor: 'pointer'
+                    }}
+                    title="Upload next pending photo immediately"
+                  >
+                    <Zap size={13} />
+                    <span>{isSyncingNow ? 'Syncing...' : 'Sync Now'}</span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={handleTogglePause}
@@ -754,6 +937,29 @@ export default function BackupProgressBar() {
                 >
                   {is_paused ? <Play size={13} /> : <Pause size={13} />}
                   <span>{is_paused ? 'Resume' : 'Pause'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleVerifyBackups}
+                  disabled={isVerifying || isUpdating}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '5px',
+                    padding: '7px 10px',
+                    background: 'rgba(16, 185, 129, 0.14)',
+                    border: '1px solid rgba(16, 185, 129, 0.35)',
+                    borderRadius: '6px',
+                    color: '#34d399',
+                    fontSize: '12px',
+                    cursor: isVerifying ? 'wait' : 'pointer'
+                  }}
+                  title="Audit Google Drive files to verify all backups exist and match size"
+                >
+                  <RefreshCw size={13} className={isVerifying ? 'animate-spin' : ''} />
+                  <span>{isVerifying ? 'Verifying...' : 'Verify'}</span>
                 </button>
 
                 <button
@@ -783,7 +989,25 @@ export default function BackupProgressBar() {
               {/* Conservative Rate Settings */}
               <form onSubmit={handleSaveSettings} style={{ borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '10px' }}>
                 <div style={{ fontSize: '11px', color: '#94a3b8', fontWeight: 600, marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                  Throttling Safeguards
+                  Backup & Throttling Settings
+                </div>
+                <div style={{ marginBottom: '8px' }}>
+                  <label style={{ fontSize: '11px', color: '#64748b', display: 'block', marginBottom: '2px' }}>Drive Folder Name</label>
+                  <input
+                    type="text"
+                    value={editFolderName}
+                    onChange={(e) => setEditFolderName(e.target.value)}
+                    placeholder="LuminaPhoto Backup"
+                    style={{
+                      width: '100%',
+                      padding: '4px 8px',
+                      background: 'rgba(0,0,0,0.3)',
+                      border: '1px solid rgba(255,255,255,0.1)',
+                      borderRadius: '4px',
+                      color: '#f8fafc',
+                      fontSize: '12px'
+                    }}
+                  />
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '8px' }}>
                   <div>
@@ -839,7 +1063,7 @@ export default function BackupProgressBar() {
                     cursor: 'pointer'
                   }}
                 >
-                  Apply Rate Limits
+                  Save Backup Settings
                 </button>
               </form>
             </div>

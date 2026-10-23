@@ -120,9 +120,54 @@ class LibraryEventHandler(FileSystemEventHandler):
 
     def on_moved(self, event: FileSystemEvent):
         if not event.is_directory:
-            dest_path = getattr(event, "dest_path", None)
+            src_raw = getattr(event, "src_path", None)
+            dest_raw = getattr(event, "dest_path", None)
+            src_path = src_raw.decode("utf-8", errors="replace") if isinstance(src_raw, bytes) else src_raw
+            dest_path = dest_raw.decode("utf-8", errors="replace") if isinstance(dest_raw, bytes) else dest_raw
+            if src_path and dest_path:
+                src_abs = os.path.abspath(src_path)
+                dest_abs = os.path.abspath(dest_path)
+                try:
+                    conn = get_connection()
+                    with conn:
+                        existing_dest = conn.execute("SELECT id FROM photos WHERE file_path = ?", (dest_abs,)).fetchone()
+                        if not existing_dest:
+                            conn.execute(
+                                "UPDATE photos SET file_path = ?, file_name = ? WHERE file_path = ?",
+                                (dest_abs, os.path.basename(dest_abs), src_abs)
+                            )
+                    conn.close()
+                except Exception:
+                    pass
             if dest_path:
                 self._enqueue(dest_path)
+
+def _discover_library_watch_roots() -> List[str]:
+    """Discovers active top-level photo directories from the database so the watcher monitors the user's library."""
+    roots: List[str] = []
+    try:
+        conn = get_connection()
+        rows = conn.execute("SELECT file_path FROM photos WHERE is_trashed = 0 LIMIT 5000").fetchall()
+        conn.close()
+        candidate_dirs = set()
+        for r in rows:
+            fp = r["file_path"]
+            if not fp:
+                continue
+            d = os.path.abspath(os.path.dirname(fp))
+            low = d.lower()
+            if "appdata" in low or "temp" in low or ".lumina_cache" in low:
+                continue
+            if os.path.isdir(d):
+                candidate_dirs.add(d)
+        # Collapse subdirectories into their highest common watched parent
+        sorted_dirs = sorted(candidate_dirs, key=lambda x: len(x))
+        for d in sorted_dirs:
+            if not any(os.path.commonpath([d, existing]) == existing for existing in roots if os.path.splitdrive(d)[0].lower() == os.path.splitdrive(existing)[0].lower()):
+                roots.append(d)
+    except Exception:
+        pass
+    return roots
 
 class FolderWatcherManager:
     _instance = None
@@ -155,7 +200,8 @@ class FolderWatcherManager:
             repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             default_watch = [
                 os.path.join(repo_root, "uploads"),
-                os.path.join(repo_root, "sample_library")
+                os.path.join(repo_root, "sample_library"),
+                *_discover_library_watch_roots()
             ]
 
             initial_paths = paths or default_watch
@@ -212,14 +258,23 @@ class FolderWatcherManager:
                         ready_paths.append(path)
                         del self.pending_queue[path]
 
+            indexed_any = False
             for path in ready_paths:
                 if is_valid_media_file(path):
                     print(f"[WATCHER] Auto-indexing new/updated media: {os.path.basename(path)}")
                     pid = index_single_photo(path)
                     if pid:
+                        indexed_any = True
                         self.processed_count += 1
                         self.last_event_time = time.time()
                         self.last_processed_file = os.path.basename(path)
+
+            if indexed_any:
+                try:
+                    from backend.backup_worker import BackupWorker
+                    BackupWorker.get_instance().trigger_wake()
+                except Exception:
+                    pass
 
             time.sleep(0.5)
 

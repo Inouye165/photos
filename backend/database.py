@@ -8,11 +8,11 @@ import json
 import os
 from typing import List, Dict, Any, Optional, Tuple
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "photos.db")
+DB_PATH = os.environ.get("LUMINA_DB_PATH") or os.path.join(os.path.dirname(__file__), "photos.db")
 
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     if db_path is None:
-        db_path = DB_PATH
+        db_path = os.environ.get("LUMINA_DB_PATH") or DB_PATH
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -154,6 +154,7 @@ def init_db(db_path: Optional[str] = None):
             x_max REAL NOT NULL,
             y_max REAL NOT NULL,
             embedding_json TEXT,
+            candidate_entities_json TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL DEFAULT 'UNASSIGNED', -- 'UNASSIGNED', 'PENDING_REVIEW', 'CONFIRMED', 'REJECTED'
             match_confidence REAL DEFAULT 0.0,
             created_at REAL NOT NULL,
@@ -210,6 +211,7 @@ def init_db(db_path: Optional[str] = None):
             x_max REAL NOT NULL,
             y_max REAL NOT NULL,
             embedding_json TEXT,
+            candidate_entities_json TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL DEFAULT 'UNASSIGNED',
             match_confidence REAL DEFAULT 0.0,
             created_at REAL NOT NULL,
@@ -218,6 +220,10 @@ def init_db(db_path: Optional[str] = None):
             FOREIGN KEY (entity_id) REFERENCES entities (id) ON DELETE SET NULL
         )
         """)
+
+        box_columns = [row[1] for row in conn.execute("PRAGMA table_info(detected_boxes)").fetchall()]
+        if "candidate_entities_json" not in box_columns:
+            conn.execute("ALTER TABLE detected_boxes ADD COLUMN candidate_entities_json TEXT NOT NULL DEFAULT '[]'")
 
         # Google Drive Backup Settings & Folder Hierarchy Cache
         conn.execute("""
@@ -240,6 +246,18 @@ def init_db(db_path: Optional[str] = None):
         )
         """)
 
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS gdrive_delete_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_id INTEGER,
+            gdrive_file_id TEXT UNIQUE NOT NULL,
+            file_name TEXT,
+            queued_at REAL NOT NULL,
+            attempts INTEGER DEFAULT 0,
+            last_error TEXT
+        )
+        """)
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_is_trashed ON photos(is_trashed)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_trashed_class ON photos(is_trashed, classification)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_effective_date ON photos(is_trashed, classification, COALESCE(date_taken, datetime(file_modified_at, 'unixepoch')) DESC)")
@@ -252,12 +270,50 @@ def init_db(db_path: Optional[str] = None):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)")
     conn.close()
 
+ALLOWED_PHOTO_COLUMNS = {
+    "file_path", "file_name", "file_size", "file_extension", "file_created_at", "file_modified_at",
+    "width", "height", "aspect_ratio", "color_mode", "format",
+    "classification", "classification_score", "classification_reason", "is_manual_override",
+    "sha256", "phash", "dhash", "duplicate_group_id", "is_primary", "duplicate_count",
+    "date_taken", "camera_make", "camera_model", "lens_model", "focal_length", "f_number",
+    "exposure_time", "iso", "flash", "orientation", "software",
+    "latitude", "longitude", "altitude", "gps_location_name",
+    "has_embedding", "raw_exif_json", "is_trashed", "trashed_at",
+    "gdrive_file_id", "gdrive_backup_status", "gdrive_backed_up_at", "gdrive_error",
+    "indexed_at"
+}
+
 def upsert_photo(photo_data: Dict[str, Any], db_path: Optional[str] = None) -> int:
-    """Inserts or updates a photo record."""
+    """
+    Inserts or updates a photo record.
+    If the local file's SHA-256 content hash changed since the last scan, automatically
+    resets gdrive_backup_status to 'pending' so the updated file is re-synced to Google Drive.
+    """
     conn = get_connection(db_path)
-    fields = list(photo_data.keys())
+    fields = [f for f in photo_data.keys() if f in ALLOWED_PHOTO_COLUMNS]
+    if not fields or "file_path" not in fields:
+        conn.close()
+        raise ValueError("Invalid photo_data columns")
     placeholders = [f":{f}" for f in fields]
-    update_clause = ", ".join([f"{f} = excluded.{f}" for f in fields if f != "file_path"])
+    manual_protected = {"classification", "classification_score", "classification_reason"}
+    has_explicit_override = bool(photo_data.get("is_manual_override"))
+    update_parts = []
+    for f in fields:
+        if f == "file_path":
+            continue
+        if f in manual_protected and not has_explicit_override:
+            update_parts.append(
+                f"{f} = CASE WHEN COALESCE(photos.is_manual_override, 0) = 1 THEN photos.{f} ELSE excluded.{f} END"
+            )
+        else:
+            update_parts.append(f"{f} = excluded.{f}")
+    if "sha256" in fields and "gdrive_backup_status" not in fields:
+        update_parts.append(
+            "gdrive_backup_status = CASE "
+            "WHEN excluded.sha256 IS NOT NULL AND photos.sha256 IS NOT NULL AND excluded.sha256 != photos.sha256 "
+            "THEN 'pending' ELSE photos.gdrive_backup_status END"
+        )
+    update_clause = ", ".join(update_parts)
     
     sql = f"""
     INSERT INTO photos ({', '.join(fields)})
@@ -532,8 +588,8 @@ def get_photos(
     if classification == "ALL":
         pass  # Don't filter by classification
     elif classification == "REAL_PHOTOS" or classification is None:
-        # Default to showing genuine camera photos unless photo_ids is explicitly provided
-        if photo_ids is None:
+        # Default to showing genuine camera photos unless photo_ids or entity_id is explicitly provided
+        if photo_ids is None and entity_id is None:
             conditions.append("classification IN ('VERIFIED_PHOTO', 'LIKELY_PHOTO')")
     elif classification:
         conditions.append("classification = ?")
@@ -822,8 +878,36 @@ def get_or_create_entity(name: str, entity_type: str = "PERSON", db_path: Option
     finally:
         conn.close()
 
+def repair_entity_avatars(db_path: Optional[str] = None) -> int:
+    """
+    Repairs any entities whose avatar_box_id points to a deleted, rejected, or reassigned box
+    by updating avatar_box_id to the entity's highest-confidence CONFIRMED (or PENDING_REVIEW) box, or NULL.
+    """
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cursor = conn.execute("""
+            UPDATE entities
+            SET avatar_box_id = (
+                SELECT b2.id FROM detected_boxes b2
+                WHERE b2.entity_id = entities.id AND b2.status IN ('CONFIRMED', 'PENDING_REVIEW')
+                ORDER BY CASE WHEN b2.status = 'CONFIRMED' THEN 0 ELSE 1 END, b2.confidence DESC, b2.id ASC
+                LIMIT 1
+            )
+            WHERE avatar_box_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM detected_boxes b_av
+                  WHERE b_av.id = entities.avatar_box_id
+                    AND b_av.entity_id = entities.id
+                    AND b_av.status != 'REJECTED'
+              )
+            """)
+            return cursor.rowcount
+    finally:
+        conn.close()
+
 def list_entities(entity_type: Optional[str] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Lists all entities with total photos count, confirmed count, pending review count, and avatar."""
+    """Lists all entities with total photos count, confirmed count, pending review count, and validated avatar."""
     conn = get_connection(db_path)
     filter_sql = ""
     params: List[Any] = []
@@ -833,20 +917,35 @@ def list_entities(entity_type: Optional[str] = None, db_path: Optional[str] = No
     
     sql = f"""
     SELECT 
-        e.*,
+        e.id,
+        e.name,
+        e.entity_type,
+        e.created_at,
+        e.updated_at,
+        CASE
+            WHEN EXISTS (
+                SELECT 1 FROM detected_boxes b_av
+                WHERE b_av.id = e.avatar_box_id AND b_av.entity_id = e.id AND b_av.status != 'REJECTED'
+            ) THEN e.avatar_box_id
+            ELSE (
+                SELECT b2.id FROM detected_boxes b2 
+                WHERE b2.entity_id = e.id AND b2.status IN ('CONFIRMED', 'PENDING_REVIEW')
+                ORDER BY CASE WHEN b2.status = 'CONFIRMED' THEN 0 ELSE 1 END, b2.confidence DESC, b2.id ASC LIMIT 1
+            )
+        END as avatar_box_id,
         COUNT(DISTINCT CASE WHEN b.status IN ('CONFIRMED', 'PENDING_REVIEW') THEN b.photo_id END) as total_photos,
         COUNT(CASE WHEN b.status = 'CONFIRMED' THEN 1 END) as confirmed_count,
         COUNT(CASE WHEN b.status = 'PENDING_REVIEW' THEN 1 END) as pending_count,
         (
             SELECT b2.id FROM detected_boxes b2 
-            WHERE b2.entity_id = e.id AND b2.status = 'CONFIRMED' 
-            ORDER BY b2.confidence DESC, b2.id ASC LIMIT 1
+            WHERE b2.entity_id = e.id AND b2.status IN ('CONFIRMED', 'PENDING_REVIEW')
+            ORDER BY CASE WHEN b2.status = 'CONFIRMED' THEN 0 ELSE 1 END, b2.confidence DESC, b2.id ASC LIMIT 1
         ) as representative_box_id
     FROM entities e
     LEFT JOIN detected_boxes b ON b.entity_id = e.id
     {filter_sql}
     GROUP BY e.id
-    ORDER BY confirmed_count DESC, e.name ASC
+    ORDER BY confirmed_count DESC, total_photos DESC, e.name ASC
     """
     cursor = conn.execute(sql, params)
     rows = [dict(r) for r in cursor.fetchall()]
@@ -860,6 +959,63 @@ def get_entity_by_id(entity_id: int, db_path: Optional[str] = None) -> Optional[
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
+
+def get_photo_tag_scores_for_entities(entity_ids: List[int], db_path: Optional[str] = None) -> Dict[int, float]:
+    """
+    Returns a map of {photo_id: tag_score} for photos tagged with the specified entity_ids
+    (status IN ('CONFIRMED', 'PENDING_REVIEW')).
+    If multiple entity_ids are requested and at least one photo contains all of them,
+    returns only the intersection (photos containing all requested entities); otherwise returns the union.
+    """
+    unique_eids = list({int(eid) for eid in (entity_ids or []) if eid is not None})
+    if not unique_eids:
+        return {}
+
+    conn = get_connection(db_path)
+    try:
+        placeholders = ",".join("?" for _ in unique_eids)
+        sql = f"""
+        SELECT photo_id, entity_id, status, match_confidence
+        FROM detected_boxes
+        WHERE entity_id IN ({placeholders})
+          AND status IN ('CONFIRMED', 'PENDING_REVIEW')
+        """
+        cursor = conn.execute(sql, unique_eids)
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {}
+
+    photo_entities: Dict[int, set] = {}
+    photo_scores: Dict[int, float] = {}
+
+    for r in rows:
+        pid = int(r["photo_id"])
+        eid = int(r["entity_id"])
+        status = r["status"]
+        conf = float(r["match_confidence"] or 0.85)
+        score = 1.0 if status == "CONFIRMED" else max(0.85, min(0.98, conf))
+
+        if pid not in photo_entities:
+            photo_entities[pid] = set()
+        photo_entities[pid].add(eid)
+
+        if pid not in photo_scores or score > photo_scores[pid]:
+            photo_scores[pid] = round(score, 4)
+
+    if len(unique_eids) > 1:
+        target_count = len(unique_eids)
+        intersection_scores = {
+            pid: photo_scores[pid]
+            for pid, eids in photo_entities.items()
+            if len(eids) == target_count
+        }
+        if intersection_scores:
+            return intersection_scores
+
+    return photo_scores
 
 def update_entity(entity_id: int, name: Optional[str] = None, entity_type: Optional[str] = None, avatar_box_id: Optional[int] = None, db_path: Optional[str] = None) -> bool:
     """Updates entity metadata."""
@@ -894,13 +1050,23 @@ def delete_entity(entity_id: int, db_path: Optional[str] = None) -> bool:
     conn.close()
     return success
 
+ALLOWED_BOX_COLUMNS = {
+    "photo_id", "entity_id", "box_type", "label", "confidence",
+    "x_min", "y_min", "x_max", "y_max",
+    "embedding_json", "candidate_entities_json", "status", "match_confidence",
+    "created_at", "reviewed_at"
+}
+
 def insert_detected_box(box_data: Dict[str, Any], db_path: Optional[str] = None) -> int:
     """Inserts a detected bounding box."""
     import time
     conn = get_connection(db_path)
     if "created_at" not in box_data:
         box_data["created_at"] = time.time()
-    fields = list(box_data.keys())
+    fields = [f for f in box_data.keys() if f in ALLOWED_BOX_COLUMNS]
+    if not fields or "photo_id" not in fields:
+        conn.close()
+        raise ValueError("Invalid box_data columns")
     placeholders = [f":{f}" for f in fields]
     sql = f"INSERT INTO detected_boxes ({', '.join(fields)}) VALUES ({', '.join(placeholders)}) RETURNING id;"
     with conn:
@@ -956,11 +1122,13 @@ def update_box_entity(box_id: int, entity_id: Optional[int], status: str = "CONF
     now = time.time()
     with conn:
         cursor = conn.execute(
-            "UPDATE detected_boxes SET entity_id = ?, status = ?, match_confidence = ?, reviewed_at = ? WHERE id = ?",
+            "UPDATE detected_boxes SET entity_id = ?, status = ?, match_confidence = ?, candidate_entities_json = '[]', reviewed_at = ? WHERE id = ?",
             (entity_id, status, match_confidence, now, box_id)
         )
         success = cursor.rowcount > 0
     conn.close()
+    if success:
+        repair_entity_avatars(db_path)
     return success
 
 def update_box_dimensions(
@@ -991,12 +1159,12 @@ def confirm_box(box_id: int, entity_id: Optional[int] = None, db_path: Optional[
     with conn:
         if entity_id is not None:
             cursor = conn.execute(
-                "UPDATE detected_boxes SET entity_id = ?, status = 'CONFIRMED', reviewed_at = ? WHERE id = ?",
+                "UPDATE detected_boxes SET entity_id = ?, status = 'CONFIRMED', candidate_entities_json = '[]', reviewed_at = ? WHERE id = ?",
                 (entity_id, now, box_id)
             )
         else:
             cursor = conn.execute(
-                "UPDATE detected_boxes SET status = 'CONFIRMED', reviewed_at = ? WHERE id = ? AND entity_id IS NOT NULL",
+                "UPDATE detected_boxes SET status = 'CONFIRMED', candidate_entities_json = '[]', reviewed_at = ? WHERE id = ? AND entity_id IS NOT NULL",
                 (now, box_id)
             )
         success = cursor.rowcount > 0
@@ -1015,6 +1183,8 @@ def reject_box(box_id: int, db_path: Optional[str] = None) -> bool:
         )
         success = cursor.rowcount > 0
     conn.close()
+    if success:
+        repair_entity_avatars(db_path)
     return success
 
 def batch_confirm_boxes(box_ids: List[int], db_path: Optional[str] = None) -> int:
@@ -1025,7 +1195,7 @@ def batch_confirm_boxes(box_ids: List[int], db_path: Optional[str] = None) -> in
     now = time.time()
     conn = get_connection(db_path)
     placeholders = ",".join("?" for _ in box_ids)
-    sql = f"UPDATE detected_boxes SET status = 'CONFIRMED', reviewed_at = ? WHERE id IN ({placeholders}) AND entity_id IS NOT NULL"
+    sql = f"UPDATE detected_boxes SET status = 'CONFIRMED', candidate_entities_json = '[]', reviewed_at = ? WHERE id IN ({placeholders}) AND entity_id IS NOT NULL"
     with conn:
         cursor = conn.execute(sql, [now] + box_ids)
         count = cursor.rowcount
@@ -1038,8 +1208,9 @@ def confirm_all_pending_boxes(db_path: Optional[str] = None) -> int:
     conn = get_connection(db_path)
     with conn:
         cursor = conn.execute(
-            "UPDATE detected_boxes SET status = 'CONFIRMED', reviewed_at = ? "
-            "WHERE status = 'PENDING_REVIEW' AND entity_id IS NOT NULL",
+            "UPDATE detected_boxes SET status = 'CONFIRMED', candidate_entities_json = '[]', reviewed_at = ? "
+            "WHERE status = 'PENDING_REVIEW' AND entity_id IS NOT NULL "
+            "AND json_array_length(candidate_entities_json) <= 1",
             (time.time(),)
         )
         count = cursor.rowcount
@@ -1079,32 +1250,46 @@ def get_pending_review_boxes(limit: int = 60, offset: int = 0, entity_id: Option
     return items, total
 
 def delete_box(box_id: int, db_path: Optional[str] = None) -> bool:
-    """Deletes a detected box."""
+    """Deletes a detected box and repairs any dangling avatar_box_id references."""
     conn = get_connection(db_path)
     with conn:
         cursor = conn.execute("DELETE FROM detected_boxes WHERE id = ?", (box_id,))
         success = cursor.rowcount > 0
     conn.close()
+    if success:
+        repair_entity_avatars(db_path)
     return success
 
 def delete_boxes_for_photo(photo_id: int, db_path: Optional[str] = None) -> int:
-    """Deletes all detected boxes for a photo."""
+    """Deletes all detected boxes for a photo and repairs any dangling avatar_box_id references."""
     conn = get_connection(db_path)
     with conn:
         cursor = conn.execute("DELETE FROM detected_boxes WHERE photo_id = ?", (photo_id,))
         count = cursor.rowcount
     conn.close()
+    if count > 0:
+        repair_entity_avatars(db_path)
     return count
 
-def get_confirmed_embeddings_for_entities(db_path: Optional[str] = None) -> Dict[int, List[List[float]]]:
-    """Retrieves all confirmed 512-d embeddings grouped by entity_id for matching."""
+def get_confirmed_embeddings_for_entities(
+    db_path: Optional[str] = None,
+    entity_type: Optional[str] = None
+) -> Dict[int, List[List[float]]]:
+    """Retrieves all confirmed 512-d embeddings grouped by entity_id for matching, optionally filtered by entity_type ('PERSON' or 'PET')."""
     conn = get_connection(db_path)
-    sql = """
-    SELECT entity_id, embedding_json 
-    FROM detected_boxes 
-    WHERE status = 'CONFIRMED' AND entity_id IS NOT NULL AND embedding_json IS NOT NULL
+    params: List[Any] = []
+    type_clause = ""
+    if entity_type:
+        type_clause = " AND e.entity_type = ?"
+        params.append(entity_type.upper())
+
+    sql = f"""
+    SELECT b.entity_id, b.embedding_json 
+    FROM detected_boxes b
+    JOIN entities e ON e.id = b.entity_id
+    WHERE b.status = 'CONFIRMED' AND b.entity_id IS NOT NULL AND b.embedding_json IS NOT NULL{type_clause}
     """
-    cursor = conn.execute(sql)
+    cursor = conn.execute(sql, params)
     results: Dict[int, List[List[float]]] = {}
     for row in cursor.fetchall():
         eid = row["entity_id"]
@@ -1314,19 +1499,46 @@ def delete_cached_gdrive_folder_by_id(folder_id: str, db_path: Optional[str] = N
     conn.close()
 
 
-def get_photos_needing_backup(limit: int = 25, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+def reset_interrupted_uploads(db_path: Optional[str] = None) -> int:
+    """Resets any photos stuck in 'uploading' state (e.g. after app restart) back to 'pending'."""
+    conn = get_connection(db_path)
+    with conn:
+        cursor = conn.execute(
+            "UPDATE photos SET gdrive_backup_status = 'pending' WHERE gdrive_backup_status = 'uploading'"
+        )
+        count = cursor.rowcount
+    conn.close()
+    return count
+
+
+def get_photos_needing_backup(
+    limit: int = 25,
+    include_failed: bool = False,
+    db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """
-    Returns active photos that need backing up to Google Drive (pending or failed, not trashed).
-    Ordered by date_taken DESC so recent photos back up first.
+    Returns photos that need backing up to Google Drive.
+    Prioritizes active photos (is_trashed = 0) first, followed by trashed photos that have never
+    been uploaded yet (is_trashed = 1 AND gdrive_file_id IS NULL) so that even photos in Trash
+    retain a cloud backup until the Trash is emptied.
+    By default excludes 'failed' photos so a single failing file never blocks the queue.
     """
     conn = get_connection(db_path)
-    cursor = conn.execute("""
-        SELECT id, file_path, file_name, file_size, date_taken, file_modified_at,
-               gdrive_file_id, gdrive_backup_status, gdrive_backed_up_at, gdrive_error
+    if include_failed:
+        status_clause = "(gdrive_backup_status IS NULL OR gdrive_backup_status IN ('pending', 'failed'))"
+    else:
+        status_clause = "(gdrive_backup_status IS NULL OR gdrive_backup_status = 'pending')"
+
+    cursor = conn.execute(f"""
+        SELECT id, file_path, file_name, file_size, sha256, date_taken, file_modified_at,
+               is_trashed, gdrive_file_id, gdrive_backup_status, gdrive_backed_up_at, gdrive_error
         FROM photos
-        WHERE is_trashed = 0
-          AND (gdrive_backup_status IS NULL OR gdrive_backup_status IN ('pending', 'failed'))
-        ORDER BY COALESCE(date_taken, datetime(file_modified_at, 'unixepoch')) DESC
+        WHERE (is_trashed = 0 OR (is_trashed = 1 AND gdrive_file_id IS NULL))
+          AND {status_clause}
+        ORDER BY
+            is_trashed ASC,
+            CASE WHEN gdrive_backup_status = 'failed' THEN 1 ELSE 0 END ASC,
+            COALESCE(date_taken, datetime(file_modified_at, 'unixepoch')) DESC
         LIMIT ?
     """, (limit,))
     rows = [dict(r) for r in cursor.fetchall()]
@@ -1346,6 +1558,25 @@ def get_trashed_photos_needing_gdrive_sync(limit: int = 50, db_path: Optional[st
         WHERE is_trashed = 1
           AND gdrive_file_id IS NOT NULL
           AND (gdrive_backup_status != 'trashed' AND gdrive_backup_status != 'deleted')
+        LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_restored_photos_needing_gdrive_sync(limit: int = 50, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Returns photos that were restored locally (is_trashed = 0) while still marked
+    as 'trashed' on Google Drive so they can be untrashed on Drive.
+    """
+    conn = get_connection(db_path)
+    cursor = conn.execute("""
+        SELECT id, file_path, file_name, gdrive_file_id, gdrive_backup_status
+        FROM photos
+        WHERE is_trashed = 0
+          AND gdrive_file_id IS NOT NULL
+          AND gdrive_backup_status = 'trashed'
         LIMIT ?
     """, (limit,))
     rows = [dict(r) for r in cursor.fetchall()]
@@ -1385,6 +1616,74 @@ def update_photo_gdrive_status(
     conn.close()
 
 
+def clear_photo_gdrive_file_id(photo_id: int, db_path: Optional[str] = None):
+    """Clears a stale/deleted Google Drive file ID and marks the photo 'pending' for re-upload."""
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute(
+            "UPDATE photos SET gdrive_file_id = NULL, gdrive_backup_status = 'pending', gdrive_error = NULL WHERE id = ?",
+            (photo_id,)
+        )
+    conn.close()
+
+
+def enqueue_gdrive_permanent_delete(
+    gdrive_file_id: str,
+    photo_id: Optional[int] = None,
+    file_name: Optional[str] = None,
+    db_path: Optional[str] = None
+):
+    """
+    Records a Google Drive file ID in the persistent deletion ledger so it is guaranteed
+    to be permanently deleted from Google Drive even if the app is offline when Trash is emptied.
+    """
+    import time
+    if not gdrive_file_id:
+        return
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO gdrive_delete_queue (photo_id, gdrive_file_id, file_name, queued_at, attempts)
+            VALUES (?, ?, ?, ?, 0)
+        """, (photo_id, gdrive_file_id, file_name or "", time.time()))
+    conn.close()
+
+
+def get_pending_gdrive_deletes(limit: int = 50, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Returns queued permanent Google Drive deletions."""
+    conn = get_connection(db_path)
+    cursor = conn.execute("""
+        SELECT id, photo_id, gdrive_file_id, file_name, queued_at, attempts, last_error
+        FROM gdrive_delete_queue
+        WHERE attempts < 10
+        ORDER BY queued_at ASC
+        LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def remove_pending_gdrive_delete(gdrive_file_id: str, db_path: Optional[str] = None):
+    """Removes a Google Drive file ID from the permanent deletion queue once confirmed deleted."""
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute("DELETE FROM gdrive_delete_queue WHERE gdrive_file_id = ?", (gdrive_file_id,))
+    conn.close()
+
+
+def record_gdrive_delete_error(gdrive_file_id: str, error: str, db_path: Optional[str] = None):
+    """Increments retry count and records the error when a permanent Drive delete fails."""
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute("""
+            UPDATE gdrive_delete_queue
+            SET attempts = attempts + 1, last_error = ?
+            WHERE gdrive_file_id = ?
+        """, (error, gdrive_file_id))
+    conn.close()
+
+
 def reset_failed_backups(db_path: Optional[str] = None) -> int:
     """Resets all failed backup attempts back to pending so they can be retried."""
     conn = get_connection(db_path)
@@ -1393,6 +1692,7 @@ def reset_failed_backups(db_path: Optional[str] = None) -> int:
             "UPDATE photos SET gdrive_backup_status = 'pending', gdrive_error = NULL WHERE gdrive_backup_status = 'failed'"
         )
         count = cursor.rowcount
+        conn.execute("UPDATE gdrive_delete_queue SET attempts = 0 WHERE attempts >= 10")
     conn.close()
     return count
 
@@ -1421,6 +1721,15 @@ def get_backup_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
     """).fetchone()
     trashed_pending_sync = trashed_pending_sync_row[0] if trashed_pending_sync_row else 0
 
+    trashed_backed_up_row = conn.execute("""
+        SELECT COUNT(*) FROM photos
+        WHERE is_trashed = 1 AND gdrive_file_id IS NOT NULL
+    """).fetchone()
+    trashed_backed_up_count = trashed_backed_up_row[0] if trashed_backed_up_row else 0
+
+    pending_delete_row = conn.execute("SELECT COUNT(*) FROM gdrive_delete_queue WHERE attempts < 10").fetchone()
+    pending_permanent_deletes = pending_delete_row[0] if pending_delete_row else 0
+
     conn.close()
     settings = get_backup_settings(db_path)
 
@@ -1430,6 +1739,8 @@ def get_backup_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
         "pending_count": pending_count,
         "failed_count": failed_count,
         "trashed_pending_sync": trashed_pending_sync,
+        "trashed_backed_up_count": trashed_backed_up_count,
+        "pending_permanent_deletes": pending_permanent_deletes,
         "hourly_limit": settings.get("hourly_limit", 25),
         "delay_seconds": settings.get("delay_seconds", 30.0),
         "root_folder_name": settings.get("root_folder_name", "LuminaPhoto Backup"),

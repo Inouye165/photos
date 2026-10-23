@@ -33,6 +33,40 @@ def is_configured() -> bool:
     return CREDENTIALS_FILE.exists()
 
 
+def save_credentials_json(raw_json: str) -> dict:
+    """
+    Validates and saves a Google Cloud OAuth 2.0 Client ID JSON file to backend/credentials.json.
+    Accepts either 'installed' (Desktop app) or 'web' client secret formats.
+    """
+    try:
+        parsed = json.loads(raw_json)
+    except Exception as exc:
+        raise ValueError(f"Invalid JSON file: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Credentials JSON must be a JSON object.")
+
+    client_config = parsed.get("installed") or parsed.get("web")
+    if not isinstance(client_config, dict):
+        raise ValueError(
+            "Invalid Google OAuth credentials file: missing 'installed' or 'web' configuration block."
+        )
+
+    client_id = str(client_config.get("client_id") or "").strip()
+    client_secret = str(client_config.get("client_secret") or "").strip()
+    if not client_id or not client_secret:
+        raise ValueError(
+            "Invalid Google OAuth credentials file: missing 'client_id' or 'client_secret'."
+        )
+
+    CREDENTIALS_FILE.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+    return {
+        "configured": True,
+        "client_type": "installed" if "installed" in parsed else "web",
+        "project_id": client_config.get("project_id", ""),
+    }
+
+
 def is_authenticated() -> bool:
     """Returns True if a valid or refreshable token is present."""
     if not TOKEN_FILE.exists():
@@ -85,34 +119,47 @@ VERIFIER_FILE = BACKEND_DIR / ".oauth_verifier.json"
 ACTIVE_VERIFIERS = {}
 
 
-def _save_verifier(state: str, verifier: str):
-    ACTIVE_VERIFIERS[state] = verifier
-    ACTIVE_VERIFIERS["latest"] = verifier
+def _save_verifier(state: str, verifier: Optional[str]):
+    if not state:
+        return
+    entry = verifier or ""
+    ACTIVE_VERIFIERS[state] = entry
     try:
         data = {}
         if VERIFIER_FILE.exists():
             data = json.loads(VERIFIER_FILE.read_text(encoding="utf-8"))
-        data[state] = verifier
-        data["latest"] = verifier
+            data.pop("latest", None)
+        data[state] = entry
         VERIFIER_FILE.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
 
 
-def _get_verifier(state: Optional[str] = None) -> Optional[str]:
-    if state and state in ACTIVE_VERIFIERS:
-        return ACTIVE_VERIFIERS[state]
-    if "latest" in ACTIVE_VERIFIERS:
-        return ACTIVE_VERIFIERS["latest"]
+def _consume_verifier(state: Optional[str] = None) -> str:
+    if not state or state == "latest":
+        raise ValueError("Missing or invalid OAuth state parameter")
+    if state in ACTIVE_VERIFIERS:
+        verifier = ACTIVE_VERIFIERS.pop(state)
+        try:
+            if VERIFIER_FILE.exists():
+                data = json.loads(VERIFIER_FILE.read_text(encoding="utf-8"))
+                data.pop(state, None)
+                data.pop("latest", None)
+                VERIFIER_FILE.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
+        return verifier
     try:
         if VERIFIER_FILE.exists():
             data = json.loads(VERIFIER_FILE.read_text(encoding="utf-8"))
-            if state and state in data:
-                return data[state]
-            return data.get("latest")
+            if state in data:
+                verifier = data.pop(state)
+                data.pop("latest", None)
+                VERIFIER_FILE.write_text(json.dumps(data), encoding="utf-8")
+                return verifier
     except Exception:
         pass
-    return None
+    raise ValueError("Invalid or expired OAuth state parameter")
 
 
 def create_auth_url(redirect_uri: str = "http://localhost:8500/api/backup/auth/callback"):
@@ -133,8 +180,7 @@ def create_auth_url(redirect_uri: str = "http://localhost:8500/api/backup/auth/c
         access_type='offline',
         include_granted_scopes='true'
     )
-    if getattr(flow, 'code_verifier', None):
-        _save_verifier(state, flow.code_verifier)
+    _save_verifier(state, getattr(flow, 'code_verifier', None))
     return auth_url, state
 
 
@@ -145,17 +191,18 @@ def exchange_auth_code(
 ) -> Credentials:
     """
     Exchanges an authorization code received from Google for tokens and saves token.json.
-    Restores the PKCE code_verifier to satisfy Google's security check.
+    Validates OAuth state and restores the PKCE code_verifier to satisfy Google's security check.
     """
     if not CREDENTIALS_FILE.exists():
         raise FileNotFoundError(f"Missing Google credentials file at {CREDENTIALS_FILE}")
+
+    verifier = _consume_verifier(state)
 
     flow = InstalledAppFlow.from_client_secrets_file(
         str(CREDENTIALS_FILE),
         SCOPES,
         redirect_uri=redirect_uri
     )
-    verifier = _get_verifier(state)
     if verifier:
         flow.code_verifier = verifier
 

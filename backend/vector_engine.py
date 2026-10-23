@@ -59,22 +59,42 @@ class VectorEngine:
                     pass
 
     def sync_with_db(self, db_path: str = DB_PATH):
-        """Ensures vector index contains valid existing photo IDs from DB."""
+        """Ensures vector index contains valid existing photo IDs from DB and resets has_embedding=0 for any DB rows missing from the vector index."""
         try:
             conn = get_connection(db_path)
-            cursor = conn.execute("SELECT id FROM photos")
-            db_ids = {r["id"] for r in cursor.fetchall()}
-            conn.close()
+            cursor = conn.execute("SELECT id, has_embedding FROM photos")
+            rows = cursor.fetchall()
+            db_ids = {r["id"] for r in rows}
+            marked_embedded_ids = {r["id"] for r in rows if r["has_embedding"]}
         except Exception:
             return
 
-        with self._lock:
-            if self.embeddings is not None and len(self.photo_ids) > 0:
-                valid_indices = [i for i, pid in enumerate(self.photo_ids) if pid in db_ids]
-                if len(valid_indices) != len(self.photo_ids):
-                    self.photo_ids = [self.photo_ids[i] for i in valid_indices]
-                    self.embeddings = self.embeddings[valid_indices] if valid_indices else None
-                    self.save_index()
+        try:
+            with self._lock:
+                if self.embeddings is not None and len(self.photo_ids) > 0:
+                    valid_indices = [i for i, pid in enumerate(self.photo_ids) if pid in db_ids]
+                    if len(valid_indices) != len(self.photo_ids):
+                        self.photo_ids = [self.photo_ids[i] for i in valid_indices]
+                        self.embeddings = self.embeddings[valid_indices] if valid_indices else None
+                        self.save_index()
+
+                indexed_set = set(self.photo_ids)
+                missing_from_index = list(marked_embedded_ids - indexed_set)
+                if missing_from_index:
+                    # Reset has_embedding=0 for photos whose embeddings were never persisted to disk
+                    batch_size = 500
+                    for i in range(0, len(missing_from_index), batch_size):
+                        chunk = missing_from_index[i:i + batch_size]
+                        placeholders = ",".join("?" for _ in chunk)
+                        conn.execute(f"UPDATE photos SET has_embedding = 0 WHERE id IN ({placeholders})", chunk)
+                    conn.commit()
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def clear_index(self):
         """Clears all in-memory embeddings and deletes vector cache file."""
@@ -86,6 +106,20 @@ class VectorEngine:
                     os.remove(VECTOR_CACHE_PATH)
                 except Exception:
                     pass
+
+    def remove_photos(self, removed_ids: List[int]):
+        """Removes specific photo IDs from in-memory embeddings and persists updated index."""
+        if not removed_ids:
+            return
+        remove_set = {int(pid) for pid in removed_ids}
+        with self._lock:
+            if not self.photo_ids or self.embeddings is None:
+                return
+            keep_indices = [i for i, pid in enumerate(self.photo_ids) if pid not in remove_set]
+            if len(keep_indices) != len(self.photo_ids):
+                self.photo_ids = [self.photo_ids[i] for i in keep_indices]
+                self.embeddings = self.embeddings[keep_indices] if keep_indices else None
+                self.save_index()
 
     def load_index(self):
         """Loads cached embeddings from disk and prunes stale IDs."""
@@ -210,6 +244,8 @@ class VectorEngine:
                                     self.embeddings = np.expand_dims(emb, axis=0)
                                 else:
                                     self.embeddings = np.vstack([self.embeddings, emb])
+                        if os.path.abspath(db_path) == os.path.abspath(DB_PATH):
+                            self.save_index()
 
                     conn = get_connection(db_path)
                     placeholders = ",".join("?" for _ in valid_ids)
@@ -224,7 +260,8 @@ class VectorEngine:
             if progress_callback:
                 progress_callback(indexed_count, total)
 
-        self.save_index()
+        if os.path.abspath(db_path) == os.path.abspath(DB_PATH):
+            self.save_index()
         return indexed_count
 
     def search_text(

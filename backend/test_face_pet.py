@@ -6,7 +6,17 @@ High-Confidence Auto-Tagging, and Confirmation Review Queue.
 import os
 import sys
 import json
+import tempfile
+import atexit
+import shutil
 import pytest
+
+# Always isolate automated tests from the live production photos.db
+if not os.environ.get("LUMINA_DB_PATH"):
+    _TEST_DB_DIR = tempfile.mkdtemp(prefix="lumina_test_suite_")
+    os.environ["LUMINA_DB_PATH"] = os.path.join(_TEST_DB_DIR, "test_photos.db")
+    atexit.register(lambda: shutil.rmtree(_TEST_DB_DIR, ignore_errors=True))
+
 from fastapi.testclient import TestClient
 
 from backend.app import app
@@ -59,12 +69,19 @@ def test_database_entity_and_boxes_crud():
     assert fetched["name"] == "Test Person Alpha Renamed"
 
     # 4. Insert detected box
-    # Find any photo in DB or use dummy photo_id = 999999
     conn = get_connection()
     row = conn.execute("SELECT id, file_path FROM photos LIMIT 1").fetchone()
+    created_dummy_photo = False
+    if row:
+        photo_id = row["id"]
+    else:
+        cur = conn.execute(
+            "INSERT INTO photos (file_path, file_name, file_size, file_extension, sha256, indexed_at) VALUES ('test_crud_photo.jpg', 'test_crud_photo.jpg', 100, '.jpg', 'crudhash123', 1000.0)"
+        )
+        photo_id = cur.lastrowid
+        conn.commit()
+        created_dummy_photo = True
     conn.close()
-    
-    photo_id = row["id"] if row else 1
 
     box_data = {
         "photo_id": photo_id,
@@ -77,6 +94,7 @@ def test_database_entity_and_boxes_crud():
         "x_max": 0.6,
         "y_max": 0.6,
         "embedding_json": json.dumps([0.1] * 512),
+        "candidate_entities_json": json.dumps([{"entity_id": eid, "score": 0.91}]),
         "status": "PENDING_REVIEW",
         "match_confidence": 0.91
     }
@@ -91,16 +109,24 @@ def test_database_entity_and_boxes_crud():
     pending_items, total_pending = get_pending_review_boxes(limit=10, entity_id=eid)
     assert total_pending >= 1
     assert any(b["id"] == box_id for b in pending_items)
+    pending_box = next(b for b in pending_items if b["id"] == box_id)
+    assert json.loads(pending_box["candidate_entities_json"])[0]["entity_id"] == eid
 
     # 7. Confirm box
     confirm_res = confirm_box(box_id)
     assert confirm_res is True
     confirmed_box = get_box_by_id(box_id)
     assert confirmed_box["status"] == "CONFIRMED"
+    assert json.loads(confirmed_box["candidate_entities_json"]) == []
 
     # 8. Clean up
     delete_box(box_id)
     delete_entity(eid)
+    if created_dummy_photo:
+        conn = get_connection()
+        conn.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+        conn.commit()
+        conn.close()
     print("Database entity and boxes CRUD test PASSED!")
 
 def test_detector_embedding_and_matching():
@@ -124,6 +150,20 @@ def test_detector_embedding_and_matching():
     assert matched_id == 100
     assert score >= 0.99
     assert status == "PENDING_REVIEW"
+
+    ambiguous_candidates = detector.rank_entity_candidates(
+        emb,
+        {100: [emb], 200: [emb], 300: [emb], 400: [emb]},
+        threshold=0.78
+    )
+    assert len(ambiguous_candidates) == 3
+
+    clear_candidates = detector.rank_entity_candidates(
+        emb,
+        {100: [emb], 200: [[-x for x in emb]]},
+        threshold=0.78
+    )
+    assert clear_candidates == [(100, 1.0)]
 
     # Weak match test (< 0.78 threshold)
     weak_emb = [0.0] * 512
@@ -286,11 +326,256 @@ def test_redundant_pet_face_cleanup_and_suppression():
         conn.commit()
         conn.close()
 
+def test_semantic_search_for_tagged_entities():
+    # Create two dummy photos and a tagged person entity
+    conn = get_connection()
+    cur1 = conn.execute(
+        "INSERT INTO photos (file_path, file_name, file_size, file_extension, classification, sha256, indexed_at) "
+        "VALUES ('test_person_search_1.jpg', 'test_person_search_1.jpg', 100, '.jpg', 'VERIFIED_PHOTO', 'hash_person_search_1', 1000.0)"
+    )
+    p1_id = cur1.lastrowid
+    cur2 = conn.execute(
+        "INSERT INTO photos (file_path, file_name, file_size, file_extension, classification, sha256, indexed_at) "
+        "VALUES ('test_person_search_2.jpg', 'test_person_search_2.jpg', 100, '.jpg', 'VERIFIED_PHOTO', 'hash_person_search_2', 1001.0)"
+    )
+    p2_id = cur2.lastrowid
+    conn.commit()
+    conn.close()
+
+    entity = get_or_create_entity("UniqueSearchPersonZeta", "PERSON")
+    eid = entity["id"]
+    b1_id = None
+    b2_id = None
+
+    try:
+        b1_id = insert_detected_box({
+            "photo_id": p1_id,
+            "entity_id": eid,
+            "box_type": "FACE",
+            "label": "person",
+            "confidence": 0.99,
+            "x_min": 0.1, "y_min": 0.1, "x_max": 0.5, "y_max": 0.5,
+            "status": "CONFIRMED",
+            "match_confidence": 1.0
+        })
+        b2_id = insert_detected_box({
+            "photo_id": p2_id,
+            "entity_id": eid,
+            "box_type": "FACE",
+            "label": "person",
+            "confidence": 0.92,
+            "x_min": 0.2, "y_min": 0.2, "x_max": 0.6, "y_max": 0.6,
+            "status": "PENDING_REVIEW",
+            "match_confidence": 0.91
+        })
+
+        # 1. Search by exact name
+        res = client.get("/api/photos", params={"query": "UniqueSearchPersonZeta"})
+        assert res.status_code == 200
+        data = res.json()
+        returned_ids = [p["id"] for p in data["photos"]]
+        assert p1_id in returned_ids
+        assert p2_id in returned_ids
+        # Confirmed photo should rank first
+        assert returned_ids.index(p1_id) < returned_ids.index(p2_id)
+        assert data["parsed_query"]["entity_ids"] == [eid]
+
+        # 2. Search with conversational prefix
+        res2 = client.get("/api/photos", params={"query": "show me photos of UniqueSearchPersonZeta"})
+        assert res2.status_code == 200
+        returned_ids_2 = [p["id"] for p in res2.json()["photos"]]
+        assert p1_id in returned_ids_2
+        assert p2_id in returned_ids_2
+        print("Semantic search for tagged entities test PASSED!")
+    finally:
+        if b1_id:
+            delete_box(b1_id)
+        if b2_id:
+            delete_box(b2_id)
+        delete_entity(eid)
+        conn = get_connection()
+        conn.execute("DELETE FROM photos WHERE id IN (?, ?)", (p1_id, p2_id))
+        conn.commit()
+        conn.close()
+
+def test_rematch_unassigned_boxes_group_photo_and_type_safety():
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="rematch_test_")
+    test_db = os.path.join(tmp_dir, "rematch.db")
+    init_db(test_db)
+
+    try:
+        conn = get_connection(test_db)
+        p1 = conn.execute(
+            "INSERT INTO photos (file_path, file_name, file_size, file_extension, classification, sha256, indexed_at) "
+            "VALUES ('p1.jpg', 'p1.jpg', 100, '.jpg', 'VERIFIED_PHOTO', 'h1', 1.0)"
+        ).lastrowid
+        p2 = conn.execute(
+            "INSERT INTO photos (file_path, file_name, file_size, file_extension, classification, sha256, indexed_at) "
+            "VALUES ('p2.jpg', 'p2.jpg', 100, '.jpg', 'VERIFIED_PHOTO', 'h2', 2.0)"
+        ).lastrowid
+        conn.commit()
+        conn.close()
+
+        person_a = get_or_create_entity("Alice", "PERSON", db_path=test_db)
+        person_b = get_or_create_entity("Bob", "PERSON", db_path=test_db)
+        pet_c = get_or_create_entity("Rex", "PET", db_path=test_db)
+
+        vec_b = [0.0] * 512
+        vec_b[10] = 1.0
+
+        # Confirm Bob on photo 1
+        insert_detected_box({
+            "photo_id": p1,
+            "entity_id": person_b["id"],
+            "box_type": "FACE",
+            "label": "person",
+            "confidence": 0.99,
+            "x_min": 0.1, "y_min": 0.1, "x_max": 0.3, "y_max": 0.3,
+            "embedding_json": json.dumps(vec_b),
+            "status": "CONFIRMED",
+            "match_confidence": 1.0
+        }, db_path=test_db)
+
+        # On photo 2 (group photo): Alice is ALREADY CONFIRMED, Bob's face is UNASSIGNED, and a PET box has Bob's vector
+        insert_detected_box({
+            "photo_id": p2,
+            "entity_id": person_a["id"],
+            "box_type": "FACE",
+            "label": "person",
+            "confidence": 0.99,
+            "x_min": 0.1, "y_min": 0.1, "x_max": 0.3, "y_max": 0.3,
+            "embedding_json": json.dumps([1.0] + [0.0] * 511),
+            "status": "CONFIRMED",
+            "match_confidence": 1.0
+        }, db_path=test_db)
+
+        bob_unassigned_id = insert_detected_box({
+            "photo_id": p2,
+            "entity_id": None,
+            "box_type": "FACE",
+            "label": "person",
+            "confidence": 0.95,
+            "x_min": 0.4, "y_min": 0.1, "x_max": 0.6, "y_max": 0.3,
+            "embedding_json": json.dumps(vec_b),
+            "status": "UNASSIGNED",
+            "match_confidence": 0.0
+        }, db_path=test_db)
+
+        pet_unassigned_id = insert_detected_box({
+            "photo_id": p2,
+            "entity_id": None,
+            "box_type": "PET",
+            "label": "dog",
+            "confidence": 0.95,
+            "x_min": 0.7, "y_min": 0.5, "x_max": 0.9, "y_max": 0.9,
+            "embedding_json": json.dumps(vec_b),
+            "status": "UNASSIGNED",
+            "match_confidence": 0.0
+        }, db_path=test_db)
+
+        detector = FacePetDetector.get_instance()
+        rematched = detector.rematch_unassigned_boxes(db_path=test_db)
+        assert rematched == 1
+
+        bob_box = get_box_by_id(bob_unassigned_id, db_path=test_db)
+        pet_box = get_box_by_id(pet_unassigned_id, db_path=test_db)
+        assert bob_box["entity_id"] == person_b["id"]
+        assert bob_box["status"] == "PENDING_REVIEW"
+        # PET box must NOT match a PERSON entity
+        assert pet_box["entity_id"] is None
+        assert pet_box["status"] == "UNASSIGNED"
+        print("Rematch unassigned boxes group photo and type safety test PASSED!")
+    finally:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+def test_top_5_fixes_verification():
+    """Verifies avatar repair, manual classification preservation on upsert, and VectorEngine.remove_photos."""
+    import tempfile
+    import numpy as np
+    from backend.database import upsert_photo, get_photo_by_id, repair_entity_avatars
+    from backend.vector_engine import VectorEngine
+
+    tmp_dir = tempfile.mkdtemp(prefix="lumina_top5_test_")
+    test_db = os.path.join(tmp_dir, "test_top5.db")
+    try:
+        init_db(db_path=test_db)
+        # 1. Verify manual classification override is preserved on re-scan upsert
+        pid = upsert_photo({
+            "file_path": "/fake/manual_override.jpg",
+            "file_name": "manual_override.jpg",
+            "file_size": 1024,
+            "file_extension": ".jpg",
+            "sha256": "hash_manual_1",
+            "indexed_at": 1000.0,
+            "classification": "GOOD",
+            "classification_score": 100.0,
+            "classification_reason": "User verified",
+            "is_manual_override": 1
+        }, db_path=test_db)
+        # Simulate scanner upserting without is_manual_override
+        upsert_photo({
+            "file_path": "/fake/manual_override.jpg",
+            "file_name": "manual_override.jpg",
+            "file_size": 1024,
+            "file_extension": ".jpg",
+            "sha256": "hash_manual_1",
+            "indexed_at": 2000.0,
+            "classification": "BAD_BLURRY",
+            "classification_score": 12.0,
+            "classification_reason": "Blurry auto check"
+        }, db_path=test_db)
+        row = get_photo_by_id(pid, db_path=test_db)
+        assert row["classification"] == "GOOD"
+        assert row["is_manual_override"] == 1
+
+        # 2. Verify repair_entity_avatars fixes broken avatar_box_id
+        person = get_or_create_entity("AvatarRepairPerson", "PERSON", db_path=test_db)
+        eid = person["id"]
+        valid_box_id = insert_detected_box({
+            "photo_id": pid,
+            "entity_id": eid,
+            "box_type": "FACE",
+            "label": "person",
+            "confidence": 0.99,
+            "x_min": 0.1, "y_min": 0.1, "x_max": 0.4, "y_max": 0.4,
+            "status": "CONFIRMED",
+            "match_confidence": 1.0
+        }, db_path=test_db)
+        # Point avatar_box_id to a non-existent box ID 999999
+        update_entity(eid, avatar_box_id=999999, db_path=test_db)
+        # list_entities should still fall back to valid_box_id even before repair
+        entities_before = list_entities(db_path=test_db)
+        ent_before = next(e for e in entities_before if e["id"] == eid)
+        assert ent_before["avatar_box_id"] == valid_box_id
+        # repair_entity_avatars should permanently fix the DB column
+        repaired = repair_entity_avatars(db_path=test_db)
+        assert repaired == 1
+        fetched = get_entity_by_id(eid, db_path=test_db)
+        assert fetched["avatar_box_id"] == valid_box_id
+
+        # 3. Verify VectorEngine.remove_photos removes deleted photo IDs from memory
+        ve = VectorEngine()
+        ve.photo_ids = [101, 202, 303]
+        ve.embeddings = np.eye(3, 512, dtype=np.float32)
+        ve.save_index = lambda: None  # no-op for unit test
+        ve.remove_photos([202])
+        assert ve.photo_ids == [101, 303]
+        assert ve.embeddings.shape == (2, 512)
+        print("Top 5 fixes verification test PASSED!")
+    finally:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 if __name__ == "__main__":
     test_database_entity_and_boxes_crud()
     test_detector_embedding_and_matching()
     test_api_endpoints()
     test_mutual_exclusion_and_duplicate_resolution()
     test_redundant_pet_face_cleanup_and_suppression()
+    test_semantic_search_for_tagged_entities()
+    test_rematch_unassigned_boxes_group_photo_and_type_safety()
+    test_top_5_fixes_verification()
     print("ALL TESTS COMPLETED SUCCESSFULLY!")
 
